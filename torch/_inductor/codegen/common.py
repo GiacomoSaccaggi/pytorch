@@ -533,12 +533,31 @@ def get_custom_backend_config_for_device(device: str) -> ConfigModule | None:
     return custom_backend_codegen_configs.get(device)
 
 
-@functools.cache
+# Guards the vendor _inductor_backend_init hook below. Concurrent callers wait
+# on the lock for an in-flight hook instead of observing a half-registered
+# device; _fired (set before the hook runs, never reset) blocks both
+# re-entrant calls and re-invocation after a failed hook, which may have left
+# partial registration behind.
+_privateuse1_backend_init_lock = threading.RLock()
+_privateuse1_backend_init_fired = False
+
+
 def init_backend_registration() -> None:
     """
     Register the backend for different devices, including the scheduling
     for kernel code generation and the host side wrapper code generation.
     """
+    # The lock must be acquired before the cached call below: a hook that
+    # re-enters this function populates the cache from the inner call while
+    # it is still running, and a concurrent caller hitting that entry would
+    # bypass a lock placed only inside the body.
+    with _privateuse1_backend_init_lock:
+        _init_backend_registration()
+
+
+@functools.cache
+def _init_backend_registration() -> None:
+    global _privateuse1_backend_init_fired
     from .cpp import CppScheduling
     from .cpp_wrapper_cpu import CppWrapperCpu
     from .cpp_wrapper_gpu import CppWrapperGpu
@@ -637,24 +656,41 @@ def init_backend_registration() -> None:
     if (
         private_backend != "privateuseone"
         and get_scheduling_for_device(private_backend) is None
+        and not _privateuse1_backend_init_fired
     ):
-        from torch.utils.backend_registration import _get_custom_mod_func
-
-        try:
-            device_scheduling = _get_custom_mod_func("Scheduling")
-            wrapper_codegen = _get_custom_mod_func("PythonWrapperCodegen")
-            cpp_wrapper_codegen = _get_custom_mod_func("CppWrapperCodegen")
-            fx_wrapper_codegen = _get_custom_mod_func("WrapperFxCodegen")
-            if device_scheduling and wrapper_codegen and cpp_wrapper_codegen:
-                register_backend_for_device(
+        device_mod = getattr(torch, private_backend, None)
+        backend_init = getattr(device_mod, "_inductor_backend_init", None)
+        if backend_init is not None:
+            # Vendor hook: runs the full inductor integration and must call
+            # register_backend_for_device itself.
+            _privateuse1_backend_init_fired = True
+            try:
+                backend_init()
+            except Exception:
+                log.warning(
+                    "inductor backend init hook for %r failed; it will not be "
+                    "retried in this process",
                     private_backend,
-                    device_scheduling,
-                    wrapper_codegen,
-                    cpp_wrapper_codegen,
-                    fx_wrapper_codegen,
                 )
-        except RuntimeError:
-            pass
+                raise
+        else:
+            from torch.utils.backend_registration import _get_custom_mod_func
+
+            try:
+                device_scheduling = _get_custom_mod_func("Scheduling")
+                wrapper_codegen = _get_custom_mod_func("PythonWrapperCodegen")
+                cpp_wrapper_codegen = _get_custom_mod_func("CppWrapperCodegen")
+                fx_wrapper_codegen = _get_custom_mod_func("WrapperFxCodegen")
+                if device_scheduling and wrapper_codegen and cpp_wrapper_codegen:
+                    register_backend_for_device(
+                        private_backend,
+                        device_scheduling,
+                        wrapper_codegen,
+                        cpp_wrapper_codegen,
+                        fx_wrapper_codegen,
+                    )
+            except RuntimeError:
+                pass
 
 
 def index_prevent_reordering(

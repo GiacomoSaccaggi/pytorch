@@ -57,6 +57,54 @@ Define the initialization hook `_autoload` for backend initialization in [torch_
 
 ::::
 
+### Lazy Inductor Backend Initialization
+
+Integrating with torch.compile typically means registering device-specific codegen
+classes, decompositions, and passes with Inductor. Doing all of that inside `_autoload`
+would make every user pay the cost at `import torch`, even those who never compile.
+To defer it, define an `_inductor_backend_init` method on the device module class
+passed to `torch._register_device_module`: a no-arg callable that Inductor invokes
+once per process, at the first Inductor compilation, on every entry point
+(`torch.compile`, direct `compile_fx()`, and AOTInductor). Inductor looks it up with
+a plain attribute lookup, so it works the same whether the device module is a class
+(methods, as below) or a module object (attribute assignment).
+
+```python
+from torch._inductor.codegen.common import register_backend_for_device
+
+
+class MyDeviceModule:
+    # ... other device module APIs (is_available, device_count, ...)
+
+    @staticmethod
+    def _inductor_backend_init():
+        # Runs on the first inductor compile, not at import time.
+        from my_backend._inductor import MyCppWrapperCodegen, MyScheduling, MyWrapperCodegen
+
+        register_backend_for_device(
+            "my_device", MyScheduling, MyWrapperCodegen, MyCppWrapperCodegen
+        )
+        # May also register decompositions, device op overrides, and custom passes.
+
+
+torch.utils.rename_privateuse1_backend("my_device")
+torch._register_device_module("my_device", MyDeviceModule)
+```
+
+The hook must call `register_backend_for_device` itself. Concurrent callers
+wait for an in-flight hook invocation to finish. If the hook raises, the exception
+propagates out of the compile and the hook is not invoked again in this process,
+since a failed hook may have left partial registration behind. Note that the
+hook is not gated on the compiled device: it fires on the first Inductor compile
+in the process, whichever device that graph targets. On the `compile_fx` paths,
+the hook runs before that compilation selects its decomposition table.
+
+Device modules that instead expose `Scheduling`, `PythonWrapperCodegen`, and
+`CppWrapperCodegen` attributes directly are still supported, but that form imports
+the codegen classes eagerly at `import torch`. A device that is already registered
+when Inductor first compiles (for example eagerly from `_autoload`) skips the hook
+entirely.
+
 ## Result
 
 After setting up the entry point and backend, build and install your backend. Now, we can use the new accelerator without explicitly importing it.
