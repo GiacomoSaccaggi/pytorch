@@ -71,3 +71,27 @@ struct EighParams {
 C10_METAL_CONSTEXPR unsigned kLUStreamNT = 256;
 C10_METAL_CONSTEXPR unsigned kLUStreamWarpsPerTG =
     kLUStreamNT / c10::metal::simdgroup_size;
+// One U-row entry per column of the 32-wide LU block.
+C10_METAL_CONSTEXPR unsigned kLUPanelWidth = 32;
+
+// Per-batch streaming LU scratch: argmax value partials (float magnitudes),
+// argmax index partials (uint), then the U row in the element type. Shared
+// host/device so the host allocates B * sizeof(LUStreamScratch<T>) bytes and
+// binds it untyped; the kernel indexes scratch[batch] and the compiler owns the
+// stride. T is float or c10::metal::complex<float> (float2 on Metal).
+template <typename T>
+struct LUStreamScratch {
+  ::c10::metal::array<float, kLUStreamNT> vpart;
+  ::c10::metal::array<uint32_t, kLUStreamNT> ipart;
+  ::c10::metal::array<T, kLUPanelWidth> uRow;
+};
+// No padding: the host size (a plain sizeof) must equal the dense float layout.
+static_assert(
+    sizeof(LUStreamScratch<float>) ==
+        sizeof(float) * kLUStreamNT * 2 + sizeof(float) * kLUPanelWidth,
+    "LUStreamScratch<float> must be densely packed");
+static_assert(
+    sizeof(LUStreamScratch<::c10::metal::complex<float>>) ==
+        sizeof(float) * kLUStreamNT * 2 +
+            sizeof(::c10::metal::complex<float>) * kLUPanelWidth,
+    "LUStreamScratch<complex<float>> must be densely packed");
