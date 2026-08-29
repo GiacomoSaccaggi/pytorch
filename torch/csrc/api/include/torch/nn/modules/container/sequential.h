@@ -127,9 +127,6 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
   std::shared_ptr<Module> clone(
       const std::optional<Device>& device = std::nullopt) const override {
     auto clone = std::make_shared<SequentialImpl>();
-    // Submodule names live in the registered children, not in `modules_`.
-    // Pushing the clones back unnamed would renumber them 0..N-1 and silently
-    // rewrite the state_dict keys of any `Sequential` built with names.
     for (const auto& child : named_children()) {
       clone->push_back(child.key(), child.value()->clone(device));
     }
