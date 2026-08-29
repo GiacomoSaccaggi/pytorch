@@ -164,11 +164,16 @@ inline std::string ComputeTypeFor() {
 // ROCBLAS and hipBLASLt.
 template <>
 inline std::string ComputeTypeFor<float>() {
-  if (at::globalContext().float32Precision(at::Float32Backend::CUDA, at::Float32Op::MATMUL) != at::Float32Precision::TF32) {
-    return "f32_r";
-  } else {
+  const auto precision = at::globalContext().float32Precision(
+      at::Float32Backend::CUDA, at::Float32Op::MATMUL);
+  if (precision == at::Float32Precision::TF32) {
     return "xf32_r";
   }
+  if (!at::NoTF32Guard::should_disable_tf32() &&
+      precision == at::Float32Precision::BF16X9) {
+    return "bf16x9_r";
+  }
+  return "f32_r";
 }
 
 template <>
@@ -214,6 +219,14 @@ inline std::string ComputeTypeFor<Float8_e4m3fnuz>() {
 template <>
 inline std::string ComputeTypeFor<Float8_e5m2fnuz>() {
   return "f32_r";
+}
+
+template <typename T>
+inline std::string ComputeTypeSignature() {
+  if constexpr (std::is_same_v<T, float>) {
+    return fmt::sprintf("_compute_%s", ComputeTypeFor<T>());
+  }
+  return "";
 }
 
 // Convert opmath_type<T> to string
@@ -291,7 +304,17 @@ struct GemmParams : OpParams {
   }
 
   std::string Signature() const override {
-    return fmt::sprintf("%c%c_%ld_%ld_%ld_ld_%ld_%ld_%ld", transa, transb, m, n, k, lda, ldb, ldc);
+    return fmt::sprintf(
+        "%c%c_%ld_%ld_%ld_ld_%ld_%ld_%ld%s",
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        ComputeTypeSignature<T>());
   }
 
   size_t GetSizeA() const {
@@ -393,7 +416,17 @@ struct GemmAndBiasParams : OpParams {
   }
 
   std::string Signature() const override {
-    return fmt::sprintf("%c%c_%ld_%ld_%ld_ld_%ld_%ld_%ld", transa, transb, m, n, k, lda, ldb, ldc);
+    return fmt::sprintf(
+        "%c%c_%ld_%ld_%ld_ld_%ld_%ld_%ld%s",
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        ComputeTypeSignature<T>());
   }
 
   size_t GetSizeA() const {
@@ -496,7 +529,18 @@ struct GemmStridedBatchedParams : OpParams {
   }
 
   std::string Signature() const override {
-    return fmt::sprintf("%c%c_%ld_%ld_%ld_B_%ld_ld_%ld_%ld_%ld", transa, transb, m, n, k, batch, lda, ldb, ldc);
+    return fmt::sprintf(
+        "%c%c_%ld_%ld_%ld_B_%ld_ld_%ld_%ld_%ld%s",
+        transa,
+        transb,
+        m,
+        n,
+        k,
+        batch,
+        lda,
+        ldb,
+        ldc,
+        ComputeTypeSignature<T>());
   }
 
   size_t GetSizeA() const {
