@@ -9,7 +9,6 @@
 #include <torch/types.h>
 
 #include <c10/util/Exception.h>
-#include <c10/util/irange.h>
 
 #include <cstdint>
 #include <memory>
