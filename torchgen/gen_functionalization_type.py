@@ -787,6 +787,33 @@ def gen_functionalization_view_inverse_declaration(
     return emit_decl_helper(g)
 
 
+# Replaying a multi-output view op to regenerate a single output builds every
+# sibling view and discards all but one, so regenerating the N views of one base
+# costs O(N^2) tensors. Under torch.compile that is O(N^2) fake tensors and
+# proxies, and it shows up as an N-long run of identical view nodes in the traced
+# graph. These are the only multi-output view ops, and each of their outputs is
+# exactly one slice or select of the base, which we can build directly. The
+# original op already validated its arguments when the view was first created.
+#
+# Keyed by operator name; the body is formatted with the view op to call, which
+# differs between the view and the view_copy variant.
+CHEAP_VIEW_REPLAY: dict[str, str] = {
+    "split.Tensor": """\
+  // split() chunk `i` is base[i * split_size : (i + 1) * split_size] along dim,
+  // and slice clamps the end, which gives the short final chunk for free.
+  auto start = split_size * out_index;
+  return {slice}(base, dim, start, start + split_size, 1);""",
+    "split_with_sizes": """\
+  c10::SymInt start = 0;
+  for (int64_t i = 0; i < out_index; ++i) {{
+    start += split_sizes[i];
+  }}
+  return {slice}(base, dim, start, start + split_sizes[out_index], 1);""",
+    "unbind.int": """\
+  return {select}(base, dim, out_index);""",
+}
+
+
 # Helper class for generating `ViewMeta` specializations.
 @dataclass
 class ViewMetaSpecialization:
@@ -875,6 +902,12 @@ class ViewMetaSpecialization:
         # List of field declarations.
         attr_declarations = "\n".join(f"  {binding.decl()};" for binding in attributes)
 
+        # Override `forward_cheap` if one output of this multi-output view
+        # can be regenerated without replaying the whole operation.
+        cheap_replay_decl = ""
+        if self.cheap_replay_body is not None:
+            cheap_replay_decl = "  Tensor forward_cheap(const Tensor& base) override;\n"
+
         # Override `to_out_index` if this operation returns more than 1 value.
         to_out_index_decl = ""
         if self.is_multi_output:
@@ -897,7 +930,7 @@ struct TORCH_API {self.classname} : public ViewMeta {{
 
   Tensor forward(const Tensor& base) override;
   Tensor reverse(const Tensor& base, const Tensor& mutated_view) override;
-{to_out_index_decl}
+{cheap_replay_decl}{to_out_index_decl}
 
   SerializableTuple to_serializable_tuple() {{
     return std::make_tuple({tuple_arguments});
@@ -944,6 +977,34 @@ struct TORCH_API {self.classname} : public ViewMeta {{
 
         return f"{opname}({arguments}){maybe_index}"
 
+    @property
+    def cheap_replay_body(self) -> str | None:
+        # A new multi-output view op would otherwise silently inherit the base
+        # forward_cheap and stay quadratic, with no golden to flag it.
+        name = str(self.f.func.name)
+        if self.is_multi_output and name not in CHEAP_VIEW_REPLAY:
+            raise AssertionError(f"multi-output view {name} has no cheap replay")
+        return CHEAP_VIEW_REPLAY.get(name)
+
+    # Body of `forward_cheap`, or None if this operation does not override it.
+    def cheap_replay_impl(self) -> str | None:
+        body = self.cheap_replay_body
+        if body is None:
+            return None
+
+        def arm(slice_op: str, select_op: str) -> str:
+            filled = body.format(slice=slice_op, select=select_op)
+            return "\n".join("  " + line for line in filled.splitlines())
+
+        return f"""
+at::Tensor {self.classname}::forward_cheap(const at::Tensor& base) {{
+  if (reapply_views) {{
+{arm("at::_ops::slice_Tensor::call", "at::_ops::select_int::call")}
+  }} else {{
+{arm("at::_ops::slice_copy_Tensor::call", "at::_ops::select_copy_int::call")}
+  }}
+}}"""
+
     def impl(self) -> list[str]:
         functions = [
             f"""
@@ -959,6 +1020,10 @@ at::Tensor {self.classname}::reverse(const at::Tensor& base, const Tensor& mutat
   return {self.opcall(is_reverse=True, reapply_views=True)};
 }}""",
         ]
+
+        single_output = self.cheap_replay_impl()
+        if single_output is not None:
+            functions.append(single_output)
 
         # If this operation returns multiple values, also generate a `to_out_index`
         # implementation.
