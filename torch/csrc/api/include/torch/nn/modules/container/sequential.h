@@ -130,9 +130,8 @@ class SequentialImpl : public Cloneable<SequentialImpl> {
     // Submodule names live in the registered children, not in `modules_`.
     // Pushing the clones back unnamed would renumber them 0..N-1 and silently
     // rewrite the state_dict keys of any `Sequential` built with names.
-    std::vector<std::string> names = named_children().keys();
-    for (const auto i : c10::irange(modules_.size())) {
-      clone->push_back(std::move(names[i]), modules_[i].clone(device));
+    for (const auto& child : named_children()) {
+      clone->push_back(child.key(), child.value()->clone(device));
     }
     return clone;
   }
