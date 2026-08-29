@@ -1102,9 +1102,10 @@ ProcessGroupNCCL::ProcessGroupNCCL(
   }
 }
 
+#ifdef NCCL_HAS_LSA_PEER_PTR
 void ProcessGroupNCCL::setGroupUid(const std::string& pg_uid) {
-  const std::string oldGroupName = getGroupUid();
   std::lock_guard<std::mutex> lock(mutex_);
+  const std::string oldGroupName = getGroupUid();
   TORCH_CHECK(
       oldGroupName.empty() || oldGroupName == pg_uid || devNCCLCommMap_.empty(),
       "ProcessGroupNCCL does not support changing a non-empty group name after "
@@ -1113,16 +1114,17 @@ void ProcessGroupNCCL::setGroupUid(const std::string& pg_uid) {
   Backend::setGroupUid(pg_uid);
   options_->group_name = pg_uid;
 
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
-  for (auto& [_, ncclComm] : devNCCLCommMap_) {
-    if (!ncclComm || ncclComm->isAborted()) {
-      continue;
+  if (oldGroupName.empty() && !pg_uid.empty()) {
+    for (auto& [_, ncclComm] : devNCCLCommMap_) {
+      if (!ncclComm || ncclComm->isAborted()) {
+        continue;
+      }
+      c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
+      publishSymmMemComm(device, ncclComm);
     }
-    c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
-    publishSymmMemComm(device, ncclComm);
   }
-#endif
 }
+#endif
 
 void ProcessGroupNCCL::eagerConnectSingleDevice(at::Device device) {
   const auto key = getKeyFromDevice(device);
@@ -1775,7 +1777,7 @@ void ProcessGroupNCCL::releaseSymmMemForComm(
 ProcessGroupNCCL::~ProcessGroupNCCL() {
   LOG(INFO) << logPrefix() << "ProcessGroupNCCL destructor entered.";
 
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
+#if defined(NCCL_HAS_LSA_PEER_PTR)
   // Drop our entry from each per-device NCCLDevCommManager. Skip aborted
   // comms -- a successor PG may have already re-registered under the same
   // group_uid (e.g. restart-after-error), and unconditionally clearing
@@ -1783,11 +1785,7 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [_, ncclComm] : devNCCLCommMap_) {
-      if (!ncclComm) {
-        continue;
-      }
-#ifdef NCCL_HAS_LSA_PEER_PTR
-      if (ncclComm->isAborted()) {
+      if (!ncclComm || ncclComm->isAborted()) {
         continue;
       }
       // ROCm, destructor-only path (shutdown()/abort() never ran, so the comms
@@ -1795,18 +1793,22 @@ ProcessGroupNCCL::~ProcessGroupNCCL() {
       // forgotten inside NCCLComm::destroy()/abort().
       c10d::symmetric_memory::close_symm_mem_for_comm(ncclComm->getNcclComm());
       releaseSymmMemForComm(ncclComm, /*reclaimDeviceTables=*/false);
-#else
-      if (ncclComm->isAborted()) {
+    }
+  }
+#elif defined(NCCL_HAS_SYMMEM_DEVICE_SUPPORT)
+  // Drop our entry from each per-device NCCLDevCommManager. Skip aborted
+  // comms -- a successor PG may have already re-registered under the same
+  // group_uid (e.g. restart-after-error), and unconditionally clearing
+  // would silently wipe the successor's entry.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [_, ncclComm] : devNCCLCommMap_) {
+      if (!ncclComm || ncclComm->isAborted()) {
         continue;
       }
-      // CUDA: NCCLDevCommManager owns the device communicators.
       c10::Device device(at::kCUDA, ncclComm->getDeviceIndex());
-      const std::string name = symmMemGroupName();
-      if (!name.empty()) {
-        c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
-            name, ncclComm->getNcclComm());
-      }
-#endif
+      c10d::symmetric_memory::NCCLDevCommManager::get(device).unregister_comm(
+          getGroupUid());
     }
   }
 #endif
@@ -3485,8 +3487,18 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
       ncclCommMemPoolMap.emplace(ncclComm, MemPoolSet{});
     }
 
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
-#ifdef USE_ROCM
+#ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+    // Publish the host ncclComm so NCCLSymmetricMemory can find it by
+    // group name, avoiding dynamic_cast back to ProcessGroupNCCL.
+    // Other producers (e.g. torchcomms' TorchCommNCCLX) populate the same
+    // registry, giving symm_mem a uniform group_name -> ncclComm_t lookup
+    // regardless of backend. Gated on NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+    // (excludes ROCm) since the registry has no other consumer there.
+    // Unregistered in ~ProcessGroupNCCL.
+    c10d::symmetric_memory::NCCLDevCommManager::get(device).register_comm(
+        getGroupUid(), ncclComm->getNcclComm());
+#endif
+#ifdef NCCL_HAS_LSA_PEER_PTR
     // RCCL samples NCCL_CUMEM_ENABLE / NCCL_WIN_ENABLE inside comm init.
     // Snapshot that value immediately against the comm identity; publication by
     // group name may happen later for shrink-created comms.
@@ -3494,7 +3506,6 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
         ncclComm->getNcclComm(),
         c10::utils::check_env("NCCL_CUMEM_ENABLE") == true &&
             c10::utils::check_env("NCCL_WIN_ENABLE") == true);
-#endif
     publishSymmMemComm(device, ncclComm);
 #endif
   }
@@ -3505,7 +3516,7 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::initNCCLComm(
   return it->second;
 }
 
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
+#ifdef NCCL_HAS_LSA_PEER_PTR
 void ProcessGroupNCCL::publishSymmMemComm(
     const at::Device& device,
     const std::shared_ptr<NCCLComm>& ncclComm) {
@@ -6402,7 +6413,7 @@ void ProcessGroupNCCL::initializeDeviceStateForComm(
   ncclEvents_.emplace(key, at::cuda::CUDAEvent(cudaEventDisableTiming));
   usedDeviceIdxs_.insert(device.index());
 
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
+#ifdef NCCL_HAS_LSA_PEER_PTR
   publishSymmMemComm(device, comm);
 #endif
 

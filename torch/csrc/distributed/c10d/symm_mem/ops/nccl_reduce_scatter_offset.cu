@@ -205,7 +205,9 @@ void nccl_reduce_scatter_offset(
   TORCH_CHECK(
       nccl_hdl != nullptr,
       "nccl_reduce_scatter_offset: requires NCCL symmetric memory backend");
+#ifdef USE_ROCM
   auto launch_guard = nccl_hdl->acquire_launch_guard();
+#endif
 
   c10::cuda::CUDAGuard guard(input.device());
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -419,8 +421,12 @@ void nccl_reduce_scatter_offset(
       "nccl_reduce_scatter_offset",
       [&]() {
 #ifdef NCCL_HAS_LSA_PEER_PTR
-        // RCCL requires destinations to be processed serially. Stream ordering
-        // preserves the slot order while each slot still uses multiple CTAs.
+        // RCCL requires destinations to be processed serially. This is safe
+        // because every rank launches slots in the same order and derives the
+        // same per-slot CTA count. For each barrier index, all ranks therefore
+        // execute the same number of acquire/release pairs, so the final
+        // release cannot complete until every rank has finished its last use
+        // of that barrier index.
         for (int j = 0; j < n_owned; ++j) {
           const int slot_start = j > 0 ? info.ctas_offset[j - 1] : 0;
           const int ctas_j = info.ctas_offset[j] - slot_start;

@@ -816,7 +816,9 @@ class TORCH_API ProcessGroupNCCL : public Backend {
     return std::string(NCCL_BACKEND_NAME);
   }
 
+#ifdef NCCL_HAS_LSA_PEER_PTR
   void setGroupUid(const std::string& pg_uid) override;
+#endif
 
   bool supportsSplitting() const override {
     return true;
@@ -1100,8 +1102,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       const at::Device& device,
       std::shared_ptr<NCCLComm> comm);
 
-#ifdef NCCL_HAS_SYMMEM_SUPPORT
-  // Publish an initialized NCCL/RCCL host communicator under this backend's
+#ifdef NCCL_HAS_LSA_PEER_PTR
+  // Publish an initialized RCCL host communicator under this backend's
   // finalized group uid. Shrink creates the communicator before Python assigns
   // the final group name, so publication must also happen from setGroupUid().
   void publishSymmMemComm(

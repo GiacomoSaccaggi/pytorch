@@ -17,6 +17,8 @@
 #define __CUDACC_EXTENDED_LAMBDA__ 1
 #endif
 
+// TODO: remove this shim once HIP exposes a detectable __vadd4 compiler or
+// library feature. Do not guard with #ifndef __vadd4; that only detects macros.
 static __device__ __forceinline__ unsigned int __vadd4(
     unsigned int a,
     unsigned int b) {

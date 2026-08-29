@@ -66,9 +66,13 @@ struct NcclDevCommCache {
     ncclDevComm devcomm{};
     ncclComm_t owner{nullptr};
   };
+  struct GroupState {
+    ska::flat_hash_map<std::string, Entry> by_key;
+    std::mutex mutex;
+  };
   ska::flat_hash_map<
       int,
-      ska::flat_hash_map<std::string, ska::flat_hash_map<std::string, Entry>>>
+      ska::flat_hash_map<std::string, std::shared_ptr<GroupState>>>
       by_device;
   std::mutex mutex;
 
@@ -81,9 +85,15 @@ struct NcclDevCommCache {
         c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(dev_idx));
         // No kernel may still be using a communicator when it is destroyed.
         C10_CUDA_CHECK(cudaDeviceSynchronize());
-        for (auto& [group, keys] : groups) {
-          for (auto& [key, entry] : keys) {
-            ncclDevCommDestroy(entry.owner, &entry.devcomm);
+        for (auto& group_entry : groups) {
+          auto& state = group_entry.second;
+          if (!state) {
+            continue;
+          }
+          std::lock_guard<std::mutex> lock(state->mutex);
+          for (auto& key_entry : state->by_key) {
+            ncclDevCommDestroy(
+                key_entry.second.owner, &key_entry.second.devcomm);
           }
         }
       } catch (...) {
@@ -118,13 +128,22 @@ void get_or_create_nccl_devcomm(
   ncclComm_t comm =
       NCCLDevCommManager::get(device).get_comm(group_name);
   auto& cache = devcomm_cache();
-  std::lock_guard<std::mutex> lock(cache.mutex);
+  std::shared_ptr<NcclDevCommCache::GroupState> state;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto& state_ref = cache.by_device[device.index()][group_name];
+    if (!state_ref) {
+      state_ref = std::make_shared<NcclDevCommCache::GroupState>();
+    }
+    state = state_ref;
+  }
+  std::lock_guard<std::mutex> state_lock(state->mutex);
   auto* live_comm = NCCLDevCommManager::get(device).get_comm(group_name);
   TORCH_CHECK(
       live_comm == comm,
       "The process-group communicator changed while creating an NCCL device "
       "communicator. Retry the operation.");
-  auto& entry = cache.by_device[device.index()][group_name][key];
+  auto& entry = state->by_key[key];
   if (entry.owner != comm) {
     // entry.owner == nullptr: first use for this (device, group, key).
     // entry.owner != nullptr: a predecessor process group's stale devcomm
@@ -150,15 +169,23 @@ void release_nccl_devcomms_for_group(
     void* comm) {
   auto* owner = static_cast<ncclComm_t>(comm);
   auto& cache = devcomm_cache();
-  std::lock_guard<std::mutex> lock(cache.mutex);
-  auto dev_it = cache.by_device.find(device.index());
-  if (dev_it == cache.by_device.end()) {
+  std::shared_ptr<NcclDevCommCache::GroupState> state;
+  {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto dev_it = cache.by_device.find(device.index());
+    if (dev_it == cache.by_device.end()) {
+      return;
+    }
+    auto group_it = dev_it->second.find(group_name);
+    if (group_it == dev_it->second.end()) {
+      return;
+    }
+    state = group_it->second;
+  }
+  if (!state) {
     return;
   }
-  auto group_it = dev_it->second.find(group_name);
-  if (group_it == dev_it->second.end()) {
-    return;
-  }
+  bool empty = false;
   // Identity-safe: erase only entries this comm owns. A stale destructor whose
   // comm was already replaced by a successor under the same group name (e.g.
   // restart-after-error) leaves the successor's entries untouched. Erase
@@ -166,16 +193,30 @@ void release_nccl_devcomms_for_group(
   // the communicator at teardown time; the owning comm reclaims the resources,
   // and only process-exit survivors need explicit destruction (see
   // ~NcclDevCommCache).
-  auto& keys = group_it->second;
-  for (auto it = keys.begin(); it != keys.end();) {
-    if (it->second.owner == owner) {
-      it = keys.erase(it);
-    } else {
-      ++it;
+  {
+    std::lock_guard<std::mutex> state_lock(state->mutex);
+    for (auto it = state->by_key.begin(); it != state->by_key.end();) {
+      if (it->second.owner == owner) {
+        it = state->by_key.erase(it);
+      } else {
+        ++it;
+      }
     }
+    empty = state->by_key.empty();
   }
-  if (keys.empty()) {
-    dev_it->second.erase(group_it);
+  if (empty) {
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto dev_it = cache.by_device.find(device.index());
+    if (dev_it == cache.by_device.end()) {
+      return;
+    }
+    auto group_it = dev_it->second.find(group_name);
+    if (group_it != dev_it->second.end() && group_it->second == state) {
+      std::lock_guard<std::mutex> state_lock(state->mutex);
+      if (state->by_key.empty()) {
+        dev_it->second.erase(group_it);
+      }
+    }
   }
 }
 #else
@@ -391,13 +432,14 @@ struct NCCLAllocation {
   size_t buffer_offset;
   int device_idx;
 #ifdef USE_ROCM
-    // A cached block can be reused during capture only when its signal pad was
-    // zeroed outside capture. Capture-time free marks the block dirty instead of
-    // issuing an illegal HIP memset.
-    bool signal_pad_clean = true;
-    // Monotonic insertion counter used by the free-cache byte-budget eviction
-    // (oldest block first).
-    uint64_t cache_seq = 0;
+  // A cached block can be reused during capture only when its signal pad was
+  // zeroed outside capture. Capture-time free marks the block dirty instead of
+  // issuing an illegal HIP memset.
+  bool signal_pad_clean = true;
+  cudaEvent_t signal_pad_zero_event = nullptr;
+  // Monotonic insertion counter used by the free-cache byte-budget eviction
+  // (oldest block first).
+  uint64_t cache_seq = 0;
 #endif
   std::mutex mutex;
   // Map of group name to peer alloc info
@@ -415,6 +457,76 @@ struct NCCLAllocation {
         device_idx(device_idx) {}
 
   ~NCCLAllocation();
+
+#ifdef USE_ROCM
+  bool signal_pad_zero_complete() const {
+    return signal_pad_zero_event == nullptr ||
+        cudaEventQuery(signal_pad_zero_event) == cudaSuccess;
+  }
+
+  void clear_signal_pad_zero_event() {
+    if (signal_pad_zero_event == nullptr) {
+      return;
+    }
+    auto err = cudaEventDestroy(signal_pad_zero_event);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "Failed to destroy NCCL symmetric-memory zero event: "
+                   << cudaGetErrorString(err);
+    }
+    signal_pad_zero_event = nullptr;
+  }
+
+  bool record_signal_pad_zero(cudaStream_t stream) {
+    if (signal_pad_zero_event == nullptr) {
+      auto err = cudaEventCreateWithFlags(
+          &signal_pad_zero_event, cudaEventDisableTiming);
+      if (err != cudaSuccess) {
+        LOG(WARNING) << "Failed to create NCCL symmetric-memory zero event: "
+                     << cudaGetErrorString(err);
+        return false;
+      }
+    }
+    auto err = cudaMemsetAsync(alloc_base, 0, buffer_offset, stream);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "Failed to zero NCCL symmetric-memory signal pad: "
+                   << cudaGetErrorString(err);
+      return false;
+    }
+    err = cudaEventRecord(signal_pad_zero_event, stream);
+    if (err != cudaSuccess) {
+      const auto sync_err = cudaStreamSynchronize(stream);
+      if (sync_err != cudaSuccess) {
+        LOG(WARNING) << "Failed to record NCCL symmetric-memory zero event and "
+                        "failed to synchronize the cleanup stream: "
+                     << cudaGetErrorString(sync_err);
+      } else {
+        LOG(WARNING) << "Failed to record NCCL symmetric-memory zero event; "
+                        "synchronized the cleanup stream instead: "
+                     << cudaGetErrorString(err);
+      }
+      return false;
+    }
+    signal_pad_clean = true;
+    return true;
+  }
+
+  bool wait_signal_pad_zero(cudaStream_t stream) {
+    if (signal_pad_zero_event == nullptr) {
+      return true;
+    }
+    const auto query = cudaEventQuery(signal_pad_zero_event);
+    if (query == cudaSuccess) {
+      return true;
+    }
+    const auto err = cudaStreamWaitEvent(stream, signal_pad_zero_event, 0);
+    if (err != cudaSuccess) {
+      LOG(WARNING) << "Failed to wait for NCCL symmetric-memory signal pad zero: "
+                   << cudaGetErrorString(err);
+      return false;
+    }
+    return true;
+  }
+#endif
 };
 
 namespace {
@@ -481,7 +593,6 @@ NCCLAllocMap::iterator find_allocation_covering(
 #if (NCCL_VERSION_CODE < NCCL_VERSION(2, 29, 0) && \
      defined(NCCL_HAS_SYMMEM_DEVICE_SUPPORT)) ||   \
     defined(NCCL_HAS_LSA_PEER_PTR)
-#define NCCL_SYMMEM_BUILD_PTR_DEV
 // Fill both peer pointer arrays in a single kernel launch. For each peer,
 // NCCL returns the window base (== signal pad base); the data buffer pointer
 // is derived as `base + buffer_offset`, mirroring the host-side layout.
@@ -794,6 +905,7 @@ NCCLAllocation::~NCCLAllocation() {
     return;
   }
   try {
+    c10::cuda::CUDAGuard guard(device_idx);
 #ifdef USE_ROCM
     // Windows must be released before their backing allocation. Explicitly
     // invalidate retained handles after deregistration and before ncclMemFree.
@@ -804,8 +916,8 @@ NCCLAllocation::~NCCLAllocation() {
       }
     }
     peer_alloc_infos_.clear();
+    clear_signal_pad_zero_event();
 #endif
-    c10::cuda::CUDAGuard guard(device_idx);
     // Single free for the combined buffer + signal pad region.
     ncclResult_t res = ncclMemFree(alloc_base);
     if (res != ncclSuccess) {
@@ -846,12 +958,16 @@ NCCLSymmetricMemoryLaunchGuard NCCLSymmetricMemory::acquire_launch_guard()
 }
 
 std::vector<void*> NCCLSymmetricMemory::get_buffer_ptrs() {
+#ifdef USE_ROCM
   pai_->check_live();
+#endif
   return pai_->buffers_;
 }
 
 std::vector<void*> NCCLSymmetricMemory::get_signal_pad_ptrs() {
+#ifdef USE_ROCM
   pai_->check_live();
+#endif
   return pai_->signal_pads_;
 }
 
@@ -868,16 +984,16 @@ static constexpr const char* kPeerPtrsUnavailable =
 #endif
 
 void** NCCLSymmetricMemory::get_buffer_ptrs_dev() {
-  pai_->check_live();
 #ifdef USE_ROCM
+  pai_->check_live();
   TORCH_CHECK(pai_->buffers_dev_ != nullptr, kPeerPtrsUnavailable);
 #endif
   return pai_->buffers_dev_;
 }
 
 void** NCCLSymmetricMemory::get_signal_pad_ptrs_dev() {
-  pai_->check_live();
 #ifdef USE_ROCM
+  pai_->check_live();
   TORCH_CHECK(pai_->signal_pads_dev_ != nullptr, kPeerPtrsUnavailable);
 #endif
   return pai_->signal_pads_dev_;
@@ -888,12 +1004,16 @@ size_t NCCLSymmetricMemory::get_buffer_size() {
 }
 
 bool NCCLSymmetricMemory::has_multicast_support() {
+#ifdef USE_ROCM
   pai_->check_live();
+#endif
   return pai_->mc_addr_ != nullptr;
 }
 
 void* NCCLSymmetricMemory::get_multicast_ptr() {
+#ifdef USE_ROCM
   pai_->check_live();
+#endif
   if (!has_multicast_support()) {
     return nullptr;
   }
@@ -902,7 +1022,9 @@ void* NCCLSymmetricMemory::get_multicast_ptr() {
 
 void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
 #if defined(NCCL_HAS_SYMMEM_DEVICE_SUPPORT) || defined(NCCL_HAS_LSA_PEER_PTR)
+#ifdef USE_ROCM
   auto launch_guard = acquire_launch_guard();
+#endif
   TORCH_CHECK(
       pai_->signal_pads_dev_ != nullptr,
       "NCCLSymmetricMemory::barrier requires peer signal pad pointers, which "
@@ -928,7 +1050,6 @@ void NCCLSymmetricMemory::barrier(int channel, size_t timeout_ms) {
 
 void NCCLSymmetricMemory::put_signal(int dst_rank, int channel, size_t timeout_ms) {
 #ifdef NCCL_HAS_ONE_SIDED_API
-  auto launch_guard = acquire_launch_guard();
   check_rank(dst_rank, world_size_);
   TORCH_CHECK(channel == 0, "channel must be 0 (sigIdx is reserved for future use)");
 
@@ -955,7 +1076,6 @@ void NCCLSymmetricMemory::put_signal(int dst_rank, int channel, size_t timeout_m
 
 void NCCLSymmetricMemory::wait_signal(int src_rank, int channel, size_t timeout_ms) {
 #ifdef NCCL_HAS_ONE_SIDED_API
-  auto launch_guard = acquire_launch_guard();
   check_rank(src_rank, world_size_);
   TORCH_CHECK(channel == 0, "channel must be 0 (sigIdx is reserved for future use)");
 
@@ -997,7 +1117,9 @@ c10::Device NCCLSymmetricMemory::get_device() {
 }
 
 ncclWindow_t NCCLSymmetricMemory::get_window() {
+#ifdef USE_ROCM
   pai_->check_live();
+#endif
   return pai_->combined_win_;
 }
 
@@ -1006,7 +1128,9 @@ size_t NCCLSymmetricMemory::get_offset() {
 }
 
 size_t NCCLSymmetricMemory::get_window_offset() {
+#ifdef USE_ROCM
   pai_->check_live();
+#endif
   // The NCCL window starts at the signal pad; this handle's data lives
   // buffer_offset_ bytes further in, plus its own offset within the buffer.
   return pai_->buffer_offset_ + offset_;
@@ -1025,7 +1149,6 @@ static constexpr const char* kHostCftHint =
 
 NCCLCftHandle NCCLSymmetricMemory::get_peer_cft_handle(int peer) {
 #ifdef NCCL_HAS_HOST_CFT
-  auto launch_guard = acquire_launch_guard();
   TORCH_CHECK(
       peer >= 0 && peer < world_size_,
       "NCCLSymmetricMemory::get_peer_cft_handle: invalid peer ",
@@ -1047,7 +1170,6 @@ NCCLCftHandle NCCLSymmetricMemory::get_peer_cft_handle(int peer) {
 
 NCCLCftHandle NCCLSymmetricMemory::get_multimem_cft_handle() {
 #ifdef NCCL_HAS_HOST_CFT
-  auto launch_guard = acquire_launch_guard();
   // Unlike the unicast query, this one may still have to bind the multicast
   // team (and barrier over the group) if the endpoint wasn't created eagerly.
   c10::cuda::CUDAGuard guard(device_idx_);
@@ -1123,8 +1245,10 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
         // here would let free -> same-address alloc form an ABA cycle and pass
         // rendezvous's final identity check for a different tensor.
         for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+          const bool ready_for_capture =
+              (*it)->signal_pad_clean && (*it)->signal_pad_zero_complete();
           if (it->use_count() == 1 &&
-              (!in_capture || (*it)->signal_pad_clean)) {
+              (!in_capture || ready_for_capture)) {
             // Preserve the normal LIFO reuse policy among eligible blocks.
             block_it = it;
           }
@@ -1139,21 +1263,30 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
           }
         }
       }
-      if (cached_alloc) {
-        if (!cached_alloc->signal_pad_clean) {
-          TORCH_INTERNAL_ASSERT(!in_capture);
-          C10_CUDA_CHECK(cudaMemset(
-              cached_alloc->alloc_base, 0, cached_alloc->buffer_offset));
-          cached_alloc->signal_pad_clean = true;
-        }
-        TORCH_INTERNAL_ASSERT(cached_alloc->buffer_size == size);
-        void* buffer_ptr = static_cast<char*>(cached_alloc->alloc_base) +
-            cached_alloc->buffer_offset;
+    }
+    if (cached_alloc) {
+      c10::cuda::CUDAGuard guard(device_idx);
+      auto stream = at::cuda::getCurrentCUDAStream().stream();
+      if (cached_alloc->signal_pad_clean) {
+        TORCH_CHECK(
+            cached_alloc->wait_signal_pad_zero(stream),
+            "Failed to order NCCL symmetric-memory signal pad cleanup before reuse.");
+      } else {
+        TORCH_INTERNAL_ASSERT(!in_capture);
+        TORCH_CHECK(
+            cached_alloc->record_signal_pad_zero(stream),
+            "Failed to zero NCCL symmetric-memory signal pad before reuse.");
+      }
+      TORCH_INTERNAL_ASSERT(cached_alloc->buffer_size == size);
+      void* buffer_ptr = static_cast<char*>(cached_alloc->alloc_base) +
+          cached_alloc->buffer_offset;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto [_, inserted] =
             allocations_.emplace(buffer_ptr, std::move(cached_alloc));
         TORCH_INTERNAL_ASSERT(inserted);
-        return buffer_ptr;
       }
+      return buffer_ptr;
     }
     TORCH_CHECK(
         !in_capture,
@@ -1169,7 +1302,12 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
     // ncclMemAlloc does not zero memory. Zero the signal pad (the first
     // buffer_offset bytes) so the CAS-based barrier() protocol starts from a
     // known all-zero state on first use.
+#ifdef USE_ROCM
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        alloc_base, 0, buffer_offset, at::cuda::getCurrentCUDAStream().stream()));
+#else
     C10_CUDA_CHECK(cudaMemset(alloc_base, 0, buffer_offset));
+#endif
     // Hand back the data buffer pointer, not alloc_base; the signal pad stays
     // hidden in front. Returning the data ptr is safe for free(): the whole
     // block is owned by the NCCLAllocation keyed below, which ncclMemFree's
@@ -1189,6 +1327,10 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
 
   void free(void* ptr) override {
 #ifdef USE_ROCM
+    // Callers must quiesce kernels using this allocation before dropping the
+    // tensor. PyTorch cannot track custom kernels that use exposed peer
+    // pointers, so free() only orders allocator-owned signal-pad cleanup before
+    // a later reuse.
     std::shared_ptr<NCCLAllocation> nccl_alloc;
     int device_idx = -1;
     {
@@ -1207,38 +1349,34 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       // where re-registering a window is illegal -- still finds them without
       // any new NCCL calls.
       erase_symm_mem_handles(ptr);
+      allocations_.erase(alloc_it);
+    }
 
-      bool in_capture = true;
-      try {
-        c10::cuda::CUDAGuard guard(device_idx);
-        in_capture = c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
-            c10::cuda::CaptureStatus::None;
-        if (!in_capture) {
-          // Best-effort cleanup for graph-capture reuse. Failures make the
-          // cached block dirty instead of throwing through tensor storage
-          // destruction.
-          auto err = cudaMemset(
-              nccl_alloc->alloc_base, 0, nccl_alloc->buffer_offset);
-          if (err == cudaSuccess) {
-            nccl_alloc->signal_pad_clean = true;
-          } else {
-            LOG(WARNING) << "Failed to zero NCCL symmetric-memory signal pad: "
-                         << cudaGetErrorString(err);
-            nccl_alloc->signal_pad_clean = false;
-          }
-        } else {
-          nccl_alloc->signal_pad_clean = false;
-        }
-      } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block: "
-                     << e.what();
-        nccl_alloc->signal_pad_clean = false;
-      } catch (...) {
-        LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block";
+    bool in_capture = true;
+    try {
+      c10::cuda::CUDAGuard guard(device_idx);
+      in_capture = c10::cuda::currentStreamCaptureStatusMayInitCtx() !=
+          c10::cuda::CaptureStatus::None;
+      if (!in_capture) {
+        // Best-effort cleanup for graph-capture reuse. The zero event orders
+        // later reuse and keeps eviction from freeing an in-flight memset.
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        nccl_alloc->signal_pad_clean = nccl_alloc->record_signal_pad_zero(stream);
+      } else {
         nccl_alloc->signal_pad_clean = false;
       }
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block: "
+                   << e.what();
+      nccl_alloc->signal_pad_clean = false;
+    } catch (...) {
+      LOG(WARNING) << "Failed to query/clean NCCL symmetric-memory free block";
+      nccl_alloc->signal_pad_clean = false;
+    }
 
-      allocations_.erase(alloc_it);
+    std::vector<std::shared_ptr<NCCLAllocation>> eviction_victims;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
       FreeCacheKey cache_key{
           nccl_alloc->buffer_size,
           nccl_alloc->buffer_offset,
@@ -1250,9 +1388,14 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       // Eviction ncclMemFree's blocks and deregisters their windows, which is
       // illegal mid-capture; let the budget go transiently over instead.
       if (!in_capture) {
-        evict_free_cache_to(device_idx, kFreeCacheByteBudget);
+        evict_free_cache_to(
+            device_idx, kFreeCacheByteBudget, eviction_victims);
       }
     }
+    // Destroying victims may deregister RCCL windows and ncclMemFree their
+    // backing blocks. RCCL operations are rank-local, so ranks may evict at
+    // different times as long as their own kernels have quiesced.
+    eviction_victims.clear();
 #else
     std::lock_guard<std::mutex> lock(mutex_);
     auto alloc_it = allocations_.find(ptr);
@@ -1549,7 +1692,10 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
 
   // Drop oldest blocks for device_idx until that device is within budget.
   // Must not be called during capture on device_idx.
-  void evict_free_cache_to(int device_idx, size_t budget) {
+  void evict_free_cache_to(
+      int device_idx,
+      size_t budget,
+      std::vector<std::shared_ptr<NCCLAllocation>>& victims) {
     auto& device_bytes = free_cache_bytes_[device_idx];
     while (device_bytes > budget) {
       NCCLAllocation* oldest = nullptr;
@@ -1560,6 +1706,9 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
           continue;
         }
         for (size_t i = 0; i < blocks.size(); i++) {
+          if (!blocks[i]->signal_pad_zero_complete()) {
+            continue;
+          }
           if (oldest == nullptr ||
               blocks[i]->cache_seq < oldest->cache_seq) {
             oldest = blocks[i].get();
@@ -1574,6 +1723,7 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
       auto& blocks = free_cache_[oldest_key];
       device_bytes -= blocks[oldest_idx]->buffer_offset +
           blocks[oldest_idx]->buffer_size;
+      victims.push_back(std::move(blocks[oldest_idx]));
       blocks.erase(blocks.begin() + static_cast<long>(oldest_idx));
       if (blocks.empty()) {
         free_cache_.erase(oldest_key);
@@ -1637,7 +1787,7 @@ bool begin_symm_mem_teardown_for_comm(
   (void)comm;
   (void)timeout;
   if (drained != nullptr) {
-    *drained = true;
+    *drained = false;
   }
   return false;
 #endif

@@ -1358,6 +1358,47 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
         t2, hdl2 = barrier_roundtrip()
         del hdl2, t2
 
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_WITH_ROCM, "ROCm-only: RCCL free-cache cleanup ordering"
+    )
+    @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
+    @requires_nccl_version(
+        (2, 29, 7), "ROCm LSA symmetric-memory support from RCCL 2.29.7"
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_nccl_symmem_reuse_waits_for_free_stream_zero(self):
+        symm_mem.set_backend("NCCL")
+        torch.cuda.set_device(self.rank)
+        c10d.all_reduce(torch.ones(1, device=self.device))
+        group_name = c10d.group.WORLD.group_name
+        numel, dtype = 1024, torch.float
+
+        t = symm_mem.empty(numel, dtype=dtype, device=self.device)
+        hdl = symm_mem.rendezvous(t, group=group_name)
+        ptr = t.data_ptr()
+        dirty_pad = hdl.get_signal_pad(self.rank, (1,), dtype=torch.uint32)
+        dirty_pad.fill_(123)
+        torch.cuda.synchronize()
+
+        free_stream = torch.cuda.Stream(device=self.device)
+        reuse_stream = torch.cuda.Stream(device=self.device)
+
+        with torch.cuda.stream(free_stream):
+            torch.cuda._sleep(100_000_000)
+            del dirty_pad, hdl, t
+            gc.collect()
+
+        with torch.cuda.stream(reuse_stream):
+            reused = symm_mem.empty(numel, dtype=dtype, device=self.device)
+            self.assertEqual(reused.data_ptr(), ptr)
+            reused_hdl = symm_mem.rendezvous(reused, group=group_name)
+            reused_pad = reused_hdl.get_signal_pad(self.rank, (1,), dtype=torch.uint32)
+            reused_pad_value = reused_pad.clone()
+
+        reuse_stream.synchronize()
+        self.assertEqual(reused_pad_value.item(), 0)
+        del reused_pad, reused_hdl, reused
+
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     @requires_nccl_version(
         (2, 29, 7) if TEST_WITH_ROCM else (2, 29),

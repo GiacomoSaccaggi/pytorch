@@ -1683,8 +1683,12 @@ class ProcessGroupNCCLGroupTest(MultiProcessTestCase):
         )
 
     @requires_nccl()
+    @requires_nccl_version((2, 29, 7), "Need RCCL 2.29.7+ for LSA peer pointers")
     @requires_world_size(2)
     @skip_if_lt_x_gpu(2)
+    @skip_but_pass_in_sandcastle_if(
+        not TEST_WITH_ROCM, "Group rename rejection is ROCm-only"
+    )
     def test_initialized_comm_rejects_group_rename(self):
         """Initialized NCCL comms cannot safely migrate registry keys."""
         _, pg = self._setup_shrink_test("rename_rejected")

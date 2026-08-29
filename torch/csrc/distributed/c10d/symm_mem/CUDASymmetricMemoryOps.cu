@@ -20,7 +20,11 @@
 #include <torch/csrc/distributed/c10d/ParamCommsUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.cuh>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory.hpp>
+#ifdef USE_ROCM
+// This include brings in nccl_dev_cap.hpp, so it must appear before testing
+// NCCL_HAS_LSA_PEER_PTR below.
 #include <torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.hpp>
+#endif
 
 #if defined(USE_ROCM) || (defined(CUDART_VERSION) && CUDART_VERSION >= 12030)
 
@@ -71,7 +75,7 @@ namespace {
 
 using namespace c10d::symmetric_memory;
 
-#if defined(NCCL_HAS_SYMMEM_SUPPORT)
+#if defined(NCCL_HAS_LSA_PEER_PTR)
 NCCLSymmetricMemoryLaunchGuard acquire_nccl_launch_guard(
     const c10::intrusive_ptr<SymmetricMemory>& symm_mem) {
   if (auto* nccl_hdl = dynamic_cast<NCCLSymmetricMemory*>(symm_mem.get())) {
