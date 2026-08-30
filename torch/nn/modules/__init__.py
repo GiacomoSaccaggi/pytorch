@@ -108,6 +108,8 @@ from .loss import (
     SoftMarginLoss,
     TripletMarginLoss,
     TripletMarginWithDistanceLoss,
+    InfoNCELoss,
+    SupConLoss,
 )
 from .normalization import (
     CrossMapLRN2d,
@@ -324,6 +326,8 @@ __all__ = [
     "TransformerEncoderLayer",
     "TripletMarginLoss",
     "TripletMarginWithDistanceLoss",
+    "InfoNCELoss",
+    "SupConLoss",
     "Unflatten",
     "Unfold",
     "Upsample",

@@ -6105,6 +6105,306 @@ def triplet_margin_with_distance_loss(
         return loss
 
 
+def info_nce_loss(
+    query: Tensor,
+    positive_key: Tensor,
+    negative_keys: Tensor | None = None,
+    temperature: float = 0.07,
+    reduction: str = "mean",
+) -> Tensor:
+    r"""Compute the InfoNCE loss (Noise Contrastive Estimation).
+
+    Also known as NT-Xent loss (Normalized Temperature-scaled Cross Entropy) in SimCLR,
+    and is the foundation of contrastive learning methods like MoCo and CLIP.
+
+    The loss for anchor :math:`i` with positive :math:`k^+` among :math:`K` negatives is:
+
+    .. math::
+        \mathcal{L}_i = -\log \frac{\exp(\operatorname{sim}(z_i, z_{k^+}) / \tau)}
+                                    {\sum_{k=0}^{K} \exp(\operatorname{sim}(z_i, z_k) / \tau)}
+
+    where :math:`\operatorname{sim}(u, v) = u^\top v / (\|u\| \|v\|)` is cosine similarity
+    and :math:`\tau` is the temperature parameter.
+
+    See :class:`~torch.nn.InfoNCELoss` for details.
+
+    Args:
+        query: Anchor embeddings of shape :math:`(N, D)`.
+        positive_key: Positive embeddings of shape :math:`(N, D)`, paired with query.
+        negative_keys: Optional explicit negatives of shape :math:`(M, D)`.
+            If ``None``, uses other samples in batch as negatives.
+        temperature: Temperature scaling parameter :math:`\tau`. Default: ``0.07``.
+        reduction (str, optional): Specifies the reduction to apply to the output:
+            ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
+
+    Returns:
+        InfoNCE loss. Scalar if reduction is ``'mean'`` or ``'sum'``,
+        tensor of shape :math:`(N,)` if ``'none'``.
+
+    Examples::
+
+        >>> query = torch.randn(32, 128)
+        >>> positive_key = torch.randn(32, 128)
+        >>> loss = F.info_nce_loss(query, positive_key, temperature=0.07)
+
+        >>> # With explicit negatives (e.g., from a memory bank)
+        >>> negative_keys = torch.randn(1024, 128)
+        >>> loss = F.info_nce_loss(query, positive_key, negative_keys)
+    """
+    if not torch.jit.is_scripting():
+        tens_ops = (query, positive_key)
+        if any(type(t) is not Tensor for t in tens_ops) and has_torch_function(
+            tens_ops
+        ):
+            return handle_torch_function(
+                info_nce_loss,
+                tens_ops,
+                query,
+                positive_key,
+                negative_keys=negative_keys,
+                temperature=temperature,
+                reduction=reduction,
+            )
+
+    if reduction not in ("none", "mean", "sum"):
+        raise ValueError(f"{reduction} is not a valid value for reduction")
+
+    if query.dim() != 2 or positive_key.dim() != 2:
+        raise ValueError(
+            f"query and positive_key must be 2D tensors, "
+            f"got {query.dim()}D and {positive_key.dim()}D"
+        )
+
+    if query.shape != positive_key.shape:
+        raise ValueError(
+            f"query and positive_key must have same shape, "
+            f"got {query.shape} and {positive_key.shape}"
+        )
+
+    batch_size = query.shape[0]
+
+    # Handle batch size 1 edge case (no negatives available)
+    if batch_size == 1 and negative_keys is None:
+        if reduction == "none":
+            return query.new_zeros(1)
+        return query.new_zeros(())
+
+    # L2 normalize embeddings
+    query = normalize(query, p=2.0, dim=1)
+    positive_key = normalize(positive_key, p=2.0, dim=1)
+
+    if negative_keys is not None:
+        if negative_keys.dim() != 2:
+            raise ValueError(
+                f"negative_keys must be 2D tensor, got {negative_keys.dim()}D"
+            )
+        if negative_keys.shape[1] != query.shape[1]:
+            raise ValueError(
+                f"negative_keys embedding dim must match query, "
+                f"got {negative_keys.shape[1]} vs {query.shape[1]}"
+            )
+        negative_keys = normalize(negative_keys, p=2.0, dim=1)
+        # Positive similarities: (N, 1)
+        positive_sim = torch.sum(query * positive_key, dim=1, keepdim=True) / temperature
+        # Negative similarities: (N, M)
+        negative_sim = torch.mm(query, negative_keys.t()) / temperature
+        # All logits: (N, 1 + M), positive in column 0
+        logits = torch.cat([positive_sim, negative_sim], dim=1)
+        targets = torch.zeros(batch_size, dtype=torch.long, device=query.device)
+        return cross_entropy(logits, targets, reduction=reduction)
+    else:
+        # SimCLR-style: other samples in batch are negatives
+        # Similarity matrix: (N, N) where diagonal is positive pair and off-diagonals are negatives
+        all_sim = torch.mm(query, positive_key.t()) / temperature
+        targets = torch.arange(batch_size, device=query.device)
+        return cross_entropy(all_sim, targets, reduction=reduction)
+
+
+def sup_con_loss(
+    features: Tensor,
+    labels: Tensor | None = None,
+    mask: Tensor | None = None,
+    temperature: float = 0.1,
+    base_temperature: float = 0.07,
+    reduction: str = "mean",
+) -> Tensor:
+    r"""Compute the Supervised Contrastive Loss.
+
+    Extends InfoNCE to the supervised setting where labels define positive pairs.
+    Samples with the same label are treated as positives, all others as negatives.
+    When neither ``labels`` nor ``mask`` is provided:
+    - for 3D features :math:`(N, \text{n\_views}, D)`, different views of the same sample are treated as positives (SimCLR-style self-supervised mode);
+    - for 2D features :math:`(N, D)`, each sample is its own single class and has no other positives (returns 0).
+
+    The loss for anchor :math:`i` is:
+
+    .. math::
+        \mathcal{L}_i = \frac{-1}{|P(i)|} \sum_{p \in P(i)} \log
+            \frac{\exp(\operatorname{sim}(z_i, z_p) / \tau)}
+                 {\sum_{a \neq i} \exp(\operatorname{sim}(z_i, z_a) / \tau)}
+
+    where :math:`P(i) = \{p : y_p = y_i, p \neq i\}` is the set of positive indices.
+
+    See :class:`~torch.nn.SupConLoss` for details.
+
+    Args:
+        features: L2-normalized embeddings of shape :math:`(N, D)` or :math:`(N, \text{n\_views}, D)`.
+        labels: Integer class labels of shape :math:`(N,)`. Default: ``None``.
+        mask: Binary mask of shape :math:`(N, N)` or :math:`(N \times \text{n\_views}, N \times \text{n\_views})`
+            defining positive pairs. Cannot specify both ``labels`` and ``mask``. Default: ``None``.
+        temperature: Temperature parameter :math:`\tau`. Default: ``0.1``.
+        base_temperature: Base temperature for loss scaling. Default: ``0.07``.
+        reduction (str, optional): ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
+
+    Returns:
+        Supervised contrastive loss. Scalar if reduction is ``'mean'`` or ``'sum'``,
+        tensor of shape :math:`(N,)` (for 2D inputs) or :math:`(N, \text{n\_views})` (for 3D inputs) if ``'none'``.
+
+    Examples::
+
+        >>> features = torch.randn(32, 128)
+        >>> labels = torch.randint(0, 10, (32,))
+        >>> loss = F.sup_con_loss(features, labels=labels)
+
+        >>> # Multi-view self-supervised mode (SimCLR with 2 augmented views per sample)
+        >>> multi_view_features = torch.randn(16, 2, 128)
+        >>> loss = F.sup_con_loss(multi_view_features)
+    """
+    if not torch.jit.is_scripting():
+        tens_ops = (features,)
+        if any(type(t) is not Tensor for t in tens_ops) and has_torch_function(
+            tens_ops
+        ):
+            return handle_torch_function(
+                sup_con_loss,
+                tens_ops,
+                features,
+                labels=labels,
+                mask=mask,
+                temperature=temperature,
+                base_temperature=base_temperature,
+                reduction=reduction,
+            )
+
+    if reduction not in ("none", "mean", "sum"):
+        raise ValueError(f"{reduction} is not a valid value for reduction")
+
+    if labels is not None and mask is not None:
+        raise ValueError("Cannot specify both labels and mask")
+
+    is_multiview = features.dim() == 3
+    if is_multiview:
+        batch_size, n_views, dim = features.shape
+        if n_views < 1 or dim < 1:
+            raise ValueError(f"Invalid features shape: {features.shape}")
+        # Flatten views: (batch_size * n_views, dim)
+        features = features.contiguous().view(batch_size * n_views, dim)
+        if labels is not None:
+            if labels.dim() != 1 or labels.shape[0] != batch_size:
+                raise ValueError(
+                    f"labels must have shape ({batch_size},), got {labels.shape}"
+                )
+            labels = labels.contiguous().view(-1, 1).repeat(1, n_views).view(-1)
+        elif mask is not None:
+            if mask.shape == (batch_size, batch_size):
+                mask = mask.repeat_interleave(n_views, dim=0).repeat_interleave(n_views, dim=1)
+            elif mask.shape != (batch_size * n_views, batch_size * n_views):
+                raise ValueError(
+                    f"mask must have shape ({batch_size}, {batch_size}) or "
+                    f"({batch_size * n_views}, {batch_size * n_views}), got {mask.shape}"
+                )
+        else:
+            # Self-supervised multi-view: views of the same sample are positive pairs
+            labels = (
+                torch.arange(batch_size, device=features.device)
+                .unsqueeze(1)
+                .repeat(1, n_views)
+                .view(-1)
+            )
+    elif features.dim() != 2:
+        raise ValueError(f"features must be 2D or 3D tensor, got {features.dim()}D")
+
+    total_samples = features.shape[0]
+    device = features.device
+
+    # L2 normalize features
+    features = normalize(features, p=2.0, dim=1)
+
+    # Similarity matrix: (total_samples, total_samples)
+    similarity = torch.mm(features, features.t()) / temperature
+
+    # Build positive mask
+    if labels is not None:
+        if labels.dim() != 1 or labels.shape[0] != total_samples:
+            raise ValueError(
+                f"labels must have shape ({total_samples},), got {labels.shape}"
+            )
+        labels_col = labels.contiguous().view(-1, 1)
+        pos_mask = torch.eq(labels_col, labels_col.t()).float()
+    elif mask is not None:
+        if mask.shape != (total_samples, total_samples):
+            raise ValueError(
+                f"mask must have shape ({total_samples}, {total_samples}), got {mask.shape}"
+            )
+        pos_mask = mask.float()
+    else:
+        # Self-supervised 2D: each sample is its own class (identity mask)
+        pos_mask = torch.eye(total_samples, device=device)
+
+    # Remove self-contrast (diagonal)
+    self_mask = ~torch.eye(total_samples, dtype=torch.bool, device=device)
+    pos_mask = pos_mask * self_mask.float()
+
+    # Handle batch size 1 or no samples
+    if total_samples == 1:
+        if reduction == "none":
+            return features.new_zeros((1, 1) if is_multiview else 1)
+        return features.new_zeros(())
+
+    # Count positives per anchor
+    num_positives = pos_mask.sum(dim=1)
+
+    # Numerical stability: subtract max over non-self similarities
+    similarity_for_max = similarity.masked_fill(~self_mask, float("-inf"))
+    sim_max, _ = torch.max(similarity_for_max, dim=1, keepdim=True)
+    sim_max = torch.where(
+        torch.isinf(sim_max), torch.zeros_like(sim_max), sim_max
+    )
+    similarity = similarity - sim_max.detach()
+
+    # Log-sum-exp over non-self samples (denominator)
+    similarity_for_lse = similarity.masked_fill(~self_mask, float("-inf"))
+    log_sum_exp = torch.logsumexp(similarity_for_lse, dim=1, keepdim=True)
+
+    # Log probabilities
+    log_prob = similarity - log_sum_exp
+
+    # Avoid division by zero for samples with no positives
+    pos_mask_safe = pos_mask.clone()
+    num_positives_safe = num_positives.clone()
+    no_positives = num_positives == 0
+    num_positives_safe[no_positives] = 1.0
+
+    # Mean log_prob over positives for each anchor
+    mean_log_prob = (pos_mask_safe * log_prob).sum(dim=1) / num_positives_safe
+
+    # Loss with temperature scaling
+    loss = -(temperature / base_temperature) * mean_log_prob
+    loss = loss * (~no_positives).float()
+
+    if reduction == "mean":
+        valid_count = (~no_positives).sum()
+        if valid_count == 0:
+            return loss.new_zeros(())
+        return loss.sum() / valid_count
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        if is_multiview:
+            return loss.view(batch_size, n_views)
+        return loss
+
+
 def normalize(
     input: Tensor,
     p: float = 2.0,

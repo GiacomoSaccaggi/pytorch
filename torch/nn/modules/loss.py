@@ -31,8 +31,10 @@ __all__ = [
     "LinearCrossEntropyLoss",
     "MultiLabelSoftMarginLoss",
     "CosineEmbeddingLoss",
+    "InfoNCELoss",
     "MarginRankingLoss",
     "MultiMarginLoss",
+    "SupConLoss",
     "TripletMarginLoss",
     "TripletMarginWithDistanceLoss",
     "CTCLoss",
@@ -2144,6 +2146,183 @@ class TripletMarginWithDistanceLoss(_Loss):
             distance_function=self.distance_function,
             margin=self.margin,
             swap=self.swap,
+            reduction=self.reduction,
+        )
+
+
+class InfoNCELoss(_Loss):
+    r"""Compute the InfoNCE loss (Noise Contrastive Estimation).
+
+    Also known as NT-Xent loss (Normalized Temperature-scaled Cross Entropy) in SimCLR,
+    and is the foundation of contrastive learning methods like MoCo and CLIP.
+
+    The loss for anchor :math:`i` with positive :math:`k^+` among :math:`K` negatives is:
+
+    .. math::
+        \mathcal{L}_i = -\log \frac{\exp(\operatorname{sim}(z_i, z_{k^+}) / \tau)}
+                                    {\sum_{k=0}^{K} \exp(\operatorname{sim}(z_i, z_k) / \tau)}
+
+    where :math:`\operatorname{sim}(u, v) = u^\top v / (\|u\| \|v\|)` is cosine similarity
+    and :math:`\tau` is the temperature parameter.
+
+    Input embeddings are automatically L2-normalized before computing similarities.
+
+    When ``negative_keys`` is ``None``, other samples in the batch are used as negatives
+    (SimCLR-style). To use explicit negatives (e.g., from a memory bank as in MoCo),
+    pass them as ``negative_keys``.
+
+    Args:
+        temperature (float, optional): Temperature parameter :math:`\tau` for scaling
+            similarities. Lower values make the distribution sharper. Default: ``0.07``.
+        reduction (str, optional): Specifies the reduction to apply to the output:
+            ``'none'`` | ``'mean'`` | ``'sum'``. ``'none'``: no reduction will be applied,
+            ``'mean'``: the sum of the output will be divided by the number of elements in
+            the output, ``'sum'``: the output will be summed. Default: ``'mean'``
+
+    Shape:
+        - query: :math:`(N, D)` where :math:`N` is batch size, :math:`D` is embedding dim.
+        - positive_key: :math:`(N, D)`, paired with query.
+        - negative_keys: :math:`(M, D)` or ``None``.
+        - Output: scalar. If :attr:`reduction` is ``'none'``, then :math:`(N,)`.
+
+    Examples::
+
+        >>> loss_fn = nn.InfoNCELoss(temperature=0.07)
+        >>> query = torch.randn(32, 128, requires_grad=True)
+        >>> positive_key = torch.randn(32, 128)
+        >>> output = loss_fn(query, positive_key)
+        >>> output.backward()
+
+        >>> # With explicit negatives from a memory bank
+        >>> negative_keys = torch.randn(1024, 128)
+        >>> output = loss_fn(query, positive_key, negative_keys)
+
+    Reference:
+        Oord et al., "Representation Learning with Contrastive Predictive Coding", 2018.
+        https://arxiv.org/abs/1807.03748
+
+        Chen et al., "A Simple Framework for Contrastive Learning of Visual
+        Representations" (SimCLR), 2020. https://arxiv.org/abs/2002.05709
+
+    .. note::
+        To compute symmetric InfoNCE (as in CLIP or bidirectional SimCLR), average the
+        loss in both directions:
+        ``0.5 * (loss_fn(query, key) + loss_fn(key, query))``.
+    """
+
+    __constants__ = ["temperature", "reduction"]
+    temperature: float
+
+    def __init__(
+        self,
+        temperature: float = 0.07,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__(reduction=reduction)
+        self.temperature = temperature
+
+    def forward(
+        self,
+        query: Tensor,
+        positive_key: Tensor,
+        negative_keys: Tensor | None = None,
+    ) -> Tensor:
+        """Runs the forward pass."""
+        return F.info_nce_loss(
+            query,
+            positive_key,
+            negative_keys,
+            temperature=self.temperature,
+            reduction=self.reduction,
+        )
+
+
+class SupConLoss(_Loss):
+    r"""Compute the Supervised Contrastive Loss.
+
+    Extends InfoNCE to the supervised setting where labels define positive pairs.
+    Samples with the same label are treated as positives, all others as negatives.
+
+    The loss for anchor :math:`i` is:
+
+    .. math::
+        \mathcal{L}_i = \frac{-1}{|P(i)|} \sum_{p \in P(i)} \log
+            \frac{\exp(\operatorname{sim}(z_i, z_p) / \tau)}
+                 {\sum_{a \neq i} \exp(\operatorname{sim}(z_i, z_a) / \tau)}
+
+    where :math:`P(i) = \{p : y_p = y_i, p \neq i\}` is the set of positive indices
+    for anchor :math:`i`, :math:`\operatorname{sim}(u, v) = u^\top v / (\|u\| \|v\|)` is
+    cosine similarity, and :math:`\tau` is the temperature parameter.
+
+    Positive pairs can be specified either via ``labels`` (samples sharing the same label)
+    or via a binary ``mask``. When neither is provided, the loss degenerates to a
+    self-supervised contrastive loss (SimCLR-style).
+
+    Input features are automatically L2-normalized.
+
+    Args:
+        temperature (float, optional): Temperature parameter :math:`\tau`. Default: ``0.1``.
+        base_temperature (float, optional): Base temperature for loss scaling. The loss is
+            scaled by ``temperature / base_temperature``. Default: ``0.07``.
+        reduction (str, optional): Specifies the reduction to apply to the output:
+            ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``
+
+    Shape:
+        - features: :math:`(N, D)` or :math:`(N, \text{n\_views}, D)` where :math:`N` is batch size,
+          :math:`\text{n\_views}` is number of views, :math:`D` is embedding dim.
+        - labels: :math:`(N,)` with integer class indices, or ``None``.
+        - mask: :math:`(N, N)` or :math:`(N \times \text{n\_views}, N \times \text{n\_views})` binary, or ``None``.
+        - Output: scalar. If :attr:`reduction` is ``'none'``, then :math:`(N,)` (for 2D inputs)
+          or :math:`(N, \text{n\_views})` (for 3D inputs).
+
+    Examples::
+
+        >>> loss_fn = nn.SupConLoss(temperature=0.1)
+        >>> features = torch.randn(32, 128, requires_grad=True)
+        >>> labels = torch.randint(0, 10, (32,))
+        >>> output = loss_fn(features, labels=labels)
+        >>> output.backward()
+
+        >>> # Multi-view self-supervised mode (SimCLR with 2 augmented views per sample)
+        >>> multi_view_features = torch.randn(16, 2, 128)
+        >>> output = loss_fn(multi_view_features)
+
+    Reference:
+        Khosla et al., "Supervised Contrastive Learning", NeurIPS 2020.
+        https://arxiv.org/abs/2004.11362
+
+    .. note::
+        Samples with no positive pairs contribute zero to the loss and do not
+        produce NaN gradients.
+    """
+
+    __constants__ = ["temperature", "base_temperature", "reduction"]
+    temperature: float
+    base_temperature: float
+
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        base_temperature: float = 0.07,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__(reduction=reduction)
+        self.temperature = temperature
+        self.base_temperature = base_temperature
+
+    def forward(
+        self,
+        features: Tensor,
+        labels: Tensor | None = None,
+        mask: Tensor | None = None,
+    ) -> Tensor:
+        """Runs the forward pass."""
+        return F.sup_con_loss(
+            features,
+            labels=labels,
+            mask=mask,
+            temperature=self.temperature,
+            base_temperature=self.base_temperature,
             reduction=self.reduction,
         )
 
