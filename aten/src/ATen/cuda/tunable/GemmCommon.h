@@ -169,8 +169,7 @@ inline std::string ComputeTypeFor<float>() {
   if (precision == at::Float32Precision::TF32) {
     return "xf32_r";
   }
-  if (!at::NoTF32Guard::should_disable_tf32() &&
-      precision == at::Float32Precision::BF16X9) {
+  if (at::cuda::blas::useBF16x9()) {
     return "bf16x9_r";
   }
   return "f32_r";
@@ -221,10 +220,13 @@ inline std::string ComputeTypeFor<Float8_e5m2fnuz>() {
   return "f32_r";
 }
 
+// CublasltMatmulTunableOp caches candidate names by Params::Signature(),
+// independently of the precision-aware TunableOp signature. Preserve existing
+// IEEE/TF32 keys while giving 16x9 its own candidate set.
 template <typename T>
 inline std::string ComputeTypeSignature() {
   if constexpr (std::is_same_v<T, float>) {
-    return fmt::sprintf("_compute_%s", ComputeTypeFor<T>());
+    return at::cuda::blas::useBF16x9() ? "_compute_bf16x9_r" : "";
   }
   return "";
 }

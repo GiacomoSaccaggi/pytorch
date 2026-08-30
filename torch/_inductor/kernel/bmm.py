@@ -222,6 +222,7 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
 
     choices: list[ChoiceCaller] = []
     if use_bf16x9:
+        # See Note [16x9 precision] in torch/_inductor/utils.py.
         choices.extend(
             V.choices.get_template_configs(
                 kernel_inputs,
@@ -335,6 +336,7 @@ def tuned_baddbmm(inp, mat1, mat2, *, alpha=1, beta=1, layout=None):
     # options to tune from
     choices: list[ChoiceCaller] = []
     if use_bf16x9:
+        # See Note [16x9 precision] in torch/_inductor/utils.py.
         choices.extend(
             V.choices.get_template_configs(
                 kernel_inputs,
