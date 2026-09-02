@@ -2173,7 +2173,8 @@ class InfoNCELoss(_Loss):
 
     Args:
         temperature (float, optional): Temperature parameter :math:`\tau` for scaling
-            similarities. Lower values make the distribution sharper. Default: ``0.07``.
+            similarities. Lower values make the distribution sharper. Must be
+            positive. Default: ``0.07``.
         reduction (str, optional): Specifies the reduction to apply to the output:
             ``'none'`` | ``'mean'`` | ``'sum'``. ``'none'``: no reduction will be applied,
             ``'mean'``: the sum of the output will be divided by the number of elements in
@@ -2208,6 +2209,11 @@ class InfoNCELoss(_Loss):
         To compute symmetric InfoNCE (as in CLIP or bidirectional SimCLR), average the
         loss in both directions:
         ``0.5 * (loss_fn(query, key) + loss_fn(key, query))``.
+
+    .. note::
+        With ``negative_keys=None`` and a batch of one, no negatives exist, so the
+        loss is exactly ``0``. Gradients still flow (they are zero), so calling
+        ``backward()`` is safe.
     """
 
     __constants__ = ["temperature", "reduction"]
@@ -2261,9 +2267,11 @@ class SupConLoss(_Loss):
     Input features are automatically L2-normalized.
 
     Args:
-        temperature (float, optional): Temperature parameter :math:`\tau`. Default: ``0.1``.
+        temperature (float, optional): Temperature parameter :math:`\tau`. Must be
+            positive. Default: ``0.1``.
         base_temperature (float, optional): Base temperature for loss scaling. The loss is
-            scaled by ``temperature / base_temperature``. Default: ``0.07``.
+            scaled by ``temperature / base_temperature``. Must be positive.
+            Default: ``0.07``.
         reduction (str, optional): Specifies the reduction to apply to the output:
             ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``
 
@@ -2292,8 +2300,10 @@ class SupConLoss(_Loss):
         https://arxiv.org/abs/2004.11362
 
     .. note::
-        Samples with no positive pairs contribute zero to the loss and do not
-        produce NaN gradients.
+        Anchors with no positive pairs contribute exactly ``0`` and are excluded from
+        the ``'mean'`` denominator, so ``'mean'`` averages only over anchors that have
+        at least one positive. Gradients stay finite in every case, and ``backward()``
+        is safe even when no anchor has a positive.
     """
 
     __constants__ = ["temperature", "base_temperature", "reduction"]

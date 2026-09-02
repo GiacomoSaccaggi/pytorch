@@ -1,420 +1,460 @@
-"""Comprehensive tests for InfoNCELoss."""
+# Owner(s): ["module: nn"]
 
-import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+    onlyCPU,
+)
+from torch.testing._internal.common_utils import (
+    gradcheck,
+    gradgradcheck,
+    run_tests,
+    TestCase,
+)
 
-from torch.nn import InfoNCELoss, info_nce_loss
 
+class TestInfoNCELoss(TestCase):
+    """Tests for nn.InfoNCELoss / F.info_nce_loss."""
 
-def get_device():
-    """Get available device for testing."""
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    def _reference(self, query, positive_key, negative_keys, temperature):
+        """Independent reference: Oord et al. Eq. (4), per-sample."""
+        query = F.normalize(query, dim=1)
+        positive_key = F.normalize(positive_key, dim=1)
+        if negative_keys is None:
+            logits = query @ positive_key.t() / temperature
+            targets = torch.arange(query.shape[0], device=query.device)
+        else:
+            negative_keys = F.normalize(negative_keys, dim=1)
+            positive_sim = (query * positive_key).sum(1, keepdim=True)
+            logits = torch.cat([positive_sim, query @ negative_keys.t()], 1)
+            logits = logits / temperature
+            targets = torch.zeros(query.shape[0], dtype=torch.long, device=query.device)
+        return F.cross_entropy(logits, targets, reduction="none")
 
-
-class TestInfoNCELossBasic:
-    """Basic functionality tests."""
-
-    def test_forward_pass(self):
-        """Test basic forward pass works."""
+    # -- basic ------------------------------------------------------------
+    def test_forward_functional_and_module_agree(self):
         query = torch.randn(32, 128)
         positive_key = torch.randn(32, 128)
-        loss = info_nce_loss(query, positive_key)
-        assert loss.shape == ()
-        assert loss.item() >= 0
+        expected = F.info_nce_loss(query, positive_key, temperature=0.07)
+        self.assertEqual(expected.shape, torch.Size([]))
+        self.assertGreaterEqual(expected.item(), 0)
+        self.assertEqual(
+            nn.InfoNCELoss(temperature=0.07)(query, positive_key), expected
+        )
 
-    def test_module_forward(self):
-        """Test module API forward pass."""
-        loss_fn = InfoNCELoss(temperature=0.07)
-        query = torch.randn(32, 128)
-        positive_key = torch.randn(32, 128)
-        loss = loss_fn(query, positive_key)
-        assert loss.shape == ()
-        assert loss.item() >= 0
-
-    def test_with_explicit_negatives(self):
-        """Test with explicit negative keys."""
+    def test_forward_with_explicit_negatives(self):
         query = torch.randn(16, 64)
         positive_key = torch.randn(16, 64)
         negative_keys = torch.randn(128, 64)
-        loss = info_nce_loss(query, positive_key, negative_keys)
-        assert loss.shape == ()
-        assert loss.item() >= 0
+        loss = F.info_nce_loss(query, positive_key, negative_keys)
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertGreaterEqual(loss.item(), 0)
+        self.assertEqual(nn.InfoNCELoss()(query, positive_key, negative_keys), loss)
 
-    def test_module_with_negatives(self):
-        """Test module API with explicit negatives."""
-        loss_fn = InfoNCELoss()
+    # -- correctness against the reference --------------------------------
+    def test_matches_reference_in_batch(self):
+        for temperature in (0.01, 0.07, 0.5, 1.0, 10.0):
+            for shape in ((4, 8), (16, 64), (33, 7)):
+                with self.subTest(temperature=temperature, shape=shape):
+                    query, positive_key = torch.randn(*shape), torch.randn(*shape)
+                    self.assertEqual(
+                        F.info_nce_loss(
+                            query,
+                            positive_key,
+                            temperature=temperature,
+                            reduction="none",
+                        ),
+                        self._reference(query, positive_key, None, temperature),
+                    )
+
+    def test_matches_reference_with_negatives(self):
+        for temperature in (0.05, 0.2, 1.0):
+            for num_negatives in (1, 7, 128):
+                with self.subTest(temperature=temperature, n=num_negatives):
+                    query, positive_key = torch.randn(9, 16), torch.randn(9, 16)
+                    negative_keys = torch.randn(num_negatives, 16)
+                    self.assertEqual(
+                        F.info_nce_loss(
+                            query,
+                            positive_key,
+                            negative_keys,
+                            temperature=temperature,
+                            reduction="none",
+                        ),
+                        self._reference(
+                            query, positive_key, negative_keys, temperature
+                        ),
+                    )
+
+    def test_high_temperature_limit_is_log_n(self):
+        """As tau -> inf the logits flatten and the loss tends to log(N)."""
+        import math
+
+        n, d = 8, 64
+        query = torch.eye(n, d)
+        loss = F.info_nce_loss(query, query.clone(), temperature=1e6)
+        self.assertEqual(loss.item(), math.log(n), atol=1e-3, rtol=0)
+
+    def test_loss_decreases_with_positive_similarity(self):
+        torch.manual_seed(123)
         query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-        negative_keys = torch.randn(128, 64)
-        loss = loss_fn(query, positive_key, negative_keys)
-        assert loss.shape == ()
+        similar = F.info_nce_loss(query, query + torch.randn(16, 64) * 0.1)
+        unrelated = F.info_nce_loss(query, torch.randn(16, 64))
+        self.assertLess(similar.item(), unrelated.item())
 
+    # -- reduction --------------------------------------------------------
+    def test_reduction_modes_are_consistent(self):
+        for use_negatives in (False, True):
+            with self.subTest(use_negatives=use_negatives):
+                query, positive_key = torch.randn(12, 24), torch.randn(12, 24)
+                negatives = torch.randn(30, 24) if use_negatives else None
+                unreduced = F.info_nce_loss(
+                    query, positive_key, negatives, reduction="none"
+                )
+                self.assertEqual(unreduced.shape, torch.Size([12]))
+                self.assertTrue((unreduced >= 0).all())
+                self.assertEqual(
+                    F.info_nce_loss(query, positive_key, negatives, reduction="mean"),
+                    unreduced.mean(),
+                )
+                self.assertEqual(
+                    F.info_nce_loss(query, positive_key, negatives, reduction="sum"),
+                    unreduced.sum(),
+                )
 
-class TestInfoNCELossGradient:
-    """Gradient computation tests."""
+    def test_invalid_reduction_raises(self):
+        query, positive_key = torch.randn(8, 32), torch.randn(8, 32)
+        with self.assertRaisesRegex(ValueError, "not a valid value for reduction"):
+            F.info_nce_loss(query, positive_key, reduction="invalid")
 
+    def test_invalid_reduction_in_module_raises_at_forward(self):
+        loss_fn = nn.InfoNCELoss(reduction="bogus")
+        with self.assertRaisesRegex(ValueError, "not a valid value for reduction"):
+            loss_fn(torch.randn(4, 8), torch.randn(4, 8))
+
+    # -- temperature ------------------------------------------------------
+    def test_temperature_must_be_positive(self):
+        query, positive_key = torch.randn(8, 32), torch.randn(8, 32)
+        for temperature in (0.0, -0.07):
+            with self.subTest(temperature=temperature):
+                with self.assertRaisesRegex(ValueError, "temperature must be positive"):
+                    F.info_nce_loss(query, positive_key, temperature=temperature)
+
+    def test_temperature_changes_loss(self):
+        torch.manual_seed(42)
+        query, positive_key = torch.randn(16, 64), torch.randn(16, 64)
+        self.assertNotEqual(
+            F.info_nce_loss(query, positive_key, temperature=0.01).item(),
+            F.info_nce_loss(query, positive_key, temperature=1.0).item(),
+        )
+
+    def test_module_stores_temperature(self):
+        self.assertEqual(nn.InfoNCELoss(temperature=0.5).temperature, 0.5)
+
+    # -- gradients --------------------------------------------------------
     def test_gradient_flow(self):
-        """Test gradients flow correctly."""
-        query = torch.randn(8, 32, requires_grad=True)
-        positive_key = torch.randn(8, 32, requires_grad=True)
-        loss = info_nce_loss(query, positive_key)
-        loss.backward()
-        assert query.grad is not None
-        assert positive_key.grad is not None
-        assert not torch.isnan(query.grad).any()
-        assert not torch.isnan(positive_key.grad).any()
-
-    def test_gradient_with_negatives(self):
-        """Test gradients with explicit negatives."""
         query = torch.randn(8, 32, requires_grad=True)
         positive_key = torch.randn(8, 32, requires_grad=True)
         negative_keys = torch.randn(64, 32, requires_grad=True)
-        loss = info_nce_loss(query, positive_key, negative_keys)
+        F.info_nce_loss(query, positive_key, negative_keys).backward()
+        for tensor in (query, positive_key, negative_keys):
+            self.assertIsNotNone(tensor.grad)
+            self.assertFalse(torch.isnan(tensor.grad).any())
+
+    def test_gradcheck(self):
+        query = torch.randn(5, 7, dtype=torch.double, requires_grad=True)
+        positive_key = torch.randn(5, 7, dtype=torch.double, requires_grad=True)
+        self.assertTrue(
+            gradcheck(
+                lambda a, b: F.info_nce_loss(a, b, temperature=0.5),
+                (query, positive_key),
+            )
+        )
+
+    def test_gradcheck_with_negatives(self):
+        query = torch.randn(4, 6, dtype=torch.double, requires_grad=True)
+        positive_key = torch.randn(4, 6, dtype=torch.double, requires_grad=True)
+        negative_keys = torch.randn(9, 6, dtype=torch.double, requires_grad=True)
+        self.assertTrue(
+            gradcheck(
+                lambda a, b, c: F.info_nce_loss(a, b, c, temperature=0.3),
+                (query, positive_key, negative_keys),
+            )
+        )
+
+    def test_gradgradcheck(self):
+        query = torch.randn(4, 5, dtype=torch.double, requires_grad=True)
+        positive_key = torch.randn(4, 5, dtype=torch.double, requires_grad=True)
+        self.assertTrue(
+            gradgradcheck(
+                lambda a, b: F.info_nce_loss(a, b, temperature=0.5),
+                (query, positive_key),
+            )
+        )
+
+    def test_optimization_reduces_loss(self):
+        torch.manual_seed(31)
+        encoder = nn.Linear(32, 16)
+        optimizer = torch.optim.Adam(encoder.parameters(), lr=0.05)
+        inputs = torch.randn(24, 32)
+        augmented = inputs + torch.randn(24, 32) * 0.05
+        losses = []
+        for _ in range(60):
+            loss = F.info_nce_loss(encoder(inputs), encoder(augmented), temperature=0.1)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+        self.assertLess(losses[-1], losses[0])
+
+    # -- edge cases -------------------------------------------------------
+    def test_batch_size_one_is_zero_and_differentiable(self):
+        """No negatives exist, so the loss is 0 but the graph stays connected."""
+        query = torch.randn(1, 32, requires_grad=True)
+        positive_key = torch.randn(1, 32, requires_grad=True)
+        loss = F.info_nce_loss(query, positive_key)
+        self.assertEqual(loss.item(), 0.0)
         loss.backward()
-        assert query.grad is not None
-        assert positive_key.grad is not None
-        assert negative_keys.grad is not None
-
-
-class TestInfoNCELossReduction:
-    """Test different reduction modes."""
-
-    def test_reduction_none(self):
-        """Test reduction='none' returns per-sample losses."""
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-        loss = info_nce_loss(query, positive_key, reduction="none")
-        assert loss.shape == (16,)
-        assert (loss >= 0).all()
-
-    def test_reduction_mean(self):
-        """Test reduction='mean' returns scalar mean."""
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-        loss_none = info_nce_loss(query, positive_key, reduction="none")
-        loss_mean = info_nce_loss(query, positive_key, reduction="mean")
-        assert loss_mean.shape == ()
-        assert torch.allclose(loss_mean, loss_none.mean())
-
-    def test_reduction_sum(self):
-        """Test reduction='sum' returns scalar sum."""
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-        loss_none = info_nce_loss(query, positive_key, reduction="none")
-        loss_sum = info_nce_loss(query, positive_key, reduction="sum")
-        assert loss_sum.shape == ()
-        assert torch.allclose(loss_sum, loss_none.sum())
-
-    def test_invalid_reduction(self):
-        """Test invalid reduction raises error."""
-        query = torch.randn(8, 32)
-        positive_key = torch.randn(8, 32)
-        with pytest.raises(ValueError, match="Invalid reduction"):
-            info_nce_loss(query, positive_key, reduction="invalid")
-
-
-class TestInfoNCELossTemperature:
-    """Test temperature parameter effects."""
-
-    def test_different_temperatures(self):
-        """Test loss varies with temperature."""
-        torch.manual_seed(42)
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-
-        loss_low_temp = info_nce_loss(query, positive_key, temperature=0.01)
-        loss_high_temp = info_nce_loss(query, positive_key, temperature=1.0)
-
-        # Lower temperature should give higher loss for random embeddings
-        # (sharper distribution = harder task)
-        assert loss_low_temp.item() != loss_high_temp.item()
-
-    def test_temperature_in_module(self):
-        """Test module stores temperature correctly."""
-        loss_fn = InfoNCELoss(temperature=0.5)
-        assert loss_fn.temperature == 0.5
-
-
-class TestInfoNCELossEdgeCases:
-    """Edge case handling tests."""
-
-    def test_batch_size_one(self):
-        """Test batch size 1 without negatives returns zero."""
-        query = torch.randn(1, 32)
-        positive_key = torch.randn(1, 32)
-        loss = info_nce_loss(query, positive_key)
-        assert loss.item() == 0.0
+        self.assertIsNotNone(query.grad)
+        self.assertFalse(torch.isnan(query.grad).any())
 
     def test_batch_size_one_reduction_none(self):
-        """Test batch size 1 with reduction='none'."""
-        query = torch.randn(1, 32)
-        positive_key = torch.randn(1, 32)
-        loss = info_nce_loss(query, positive_key, reduction="none")
-        assert loss.shape == (1,)
-        assert loss.item() == 0.0
+        loss = F.info_nce_loss(torch.randn(1, 32), torch.randn(1, 32), reduction="none")
+        self.assertEqual(loss.shape, torch.Size([1]))
+        self.assertEqual(loss.item(), 0.0)
 
-    def test_batch_size_one_with_negatives(self):
-        """Test batch size 1 with explicit negatives works."""
-        query = torch.randn(1, 32)
-        positive_key = torch.randn(1, 32)
-        negative_keys = torch.randn(64, 32)
-        loss = info_nce_loss(query, positive_key, negative_keys)
-        assert loss.item() > 0  # Should have non-zero loss with negatives
+    def test_batch_size_one_with_negatives_is_nonzero(self):
+        loss = F.info_nce_loss(
+            torch.randn(1, 32), torch.randn(1, 32), torch.randn(64, 32)
+        )
+        self.assertGreater(loss.item(), 0)
 
     def test_batch_size_two(self):
-        """Test batch size 2 (minimal case with negatives)."""
-        query = torch.randn(2, 32)
-        positive_key = torch.randn(2, 32)
-        loss = info_nce_loss(query, positive_key)
-        assert loss.item() >= 0
+        loss = F.info_nce_loss(torch.randn(2, 32), torch.randn(2, 32))
+        self.assertGreaterEqual(loss.item(), 0)
 
-    def test_invalid_query_dim(self):
-        """Test invalid query dimension raises error."""
-        query = torch.randn(8)  # 1D instead of 2D
-        positive_key = torch.randn(8, 32)
-        with pytest.raises(ValueError, match="must be 2D"):
-            info_nce_loss(query, positive_key)
+    def test_embedding_dim_one(self):
+        self.assertTrue(
+            torch.isfinite(F.info_nce_loss(torch.randn(8, 1), torch.randn(8, 1)))
+        )
 
-    def test_shape_mismatch(self):
-        """Test shape mismatch raises error."""
-        query = torch.randn(8, 32)
-        positive_key = torch.randn(16, 32)  # Different batch size
-        with pytest.raises(ValueError, match="same shape"):
-            info_nce_loss(query, positive_key)
+    def test_empty_batch_does_not_crash(self):
+        """Matches other PyTorch losses: an empty mean reduction is NaN."""
+        loss = F.info_nce_loss(torch.randn(0, 16), torch.randn(0, 16))
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertEqual(
+            F.info_nce_loss(
+                torch.randn(0, 16), torch.randn(0, 16), reduction="none"
+            ).shape,
+            torch.Size([0]),
+        )
 
-    def test_negative_keys_dim_mismatch(self):
-        """Test negative keys embedding dimension mismatch."""
-        query = torch.randn(8, 32)
-        positive_key = torch.randn(8, 32)
-        negative_keys = torch.randn(64, 64)  # Wrong embedding dim
-        with pytest.raises(ValueError, match="embedding dim must match"):
-            info_nce_loss(query, positive_key, negative_keys)
+    def test_non_contiguous_inputs(self):
+        query = torch.randn(16, 64)[::2]
+        self.assertFalse(query.is_contiguous())
+        self.assertTrue(torch.isfinite(F.info_nce_loss(query, torch.randn(8, 64))))
 
+    def test_invalid_dimensions_raise(self):
+        with self.assertRaisesRegex(ValueError, "must be 2D"):
+            F.info_nce_loss(torch.randn(8), torch.randn(8, 32))
+        with self.assertRaisesRegex(ValueError, "must be 2D"):
+            F.info_nce_loss(torch.randn(2, 3, 4), torch.randn(2, 3, 4))
 
-class TestInfoNCELossNumericalStability:
-    """Numerical stability tests."""
+    def test_shape_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            F.info_nce_loss(torch.randn(8, 32), torch.randn(16, 32))
 
-    def test_large_embeddings(self):
-        """Test with large embedding values."""
-        query = torch.randn(16, 64) * 100
-        positive_key = torch.randn(16, 64) * 100
-        loss = info_nce_loss(query, positive_key)
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
+    def test_negative_keys_validation(self):
+        query, positive_key = torch.randn(8, 32), torch.randn(8, 32)
+        with self.assertRaisesRegex(ValueError, "must be 2D"):
+            F.info_nce_loss(query, positive_key, torch.randn(64))
+        with self.assertRaisesRegex(ValueError, "embedding dim must match"):
+            F.info_nce_loss(query, positive_key, torch.randn(64, 64))
 
-    def test_small_temperature(self):
-        """Test with very small temperature."""
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-        loss = info_nce_loss(query, positive_key, temperature=0.001)
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
+    # -- numerical stability ----------------------------------------------
+    def test_extreme_input_scales(self):
+        for scale in (1e-8, 1e-4, 1e4, 1e8):
+            with self.subTest(scale=scale):
+                loss = F.info_nce_loss(
+                    torch.randn(8, 16) * scale, torch.randn(8, 16) * scale
+                )
+                self.assertTrue(torch.isfinite(loss))
 
-    def test_gradient_stability_large_logits(self):
-        """Test gradient stability with large logits."""
-        query = torch.randn(8, 32) * 10
-        positive_key = torch.randn(8, 32) * 10
-        query.requires_grad_(True)
-        positive_key.requires_grad_(True)
-        loss = info_nce_loss(query, positive_key, temperature=0.01)
-        loss.backward()
-        assert query.grad is not None
-        assert positive_key.grad is not None
-        assert not torch.isnan(query.grad).any()
-        assert not torch.isnan(positive_key.grad).any()
+    def test_extreme_temperatures(self):
+        query, positive_key = torch.randn(8, 16), torch.randn(8, 16)
+        for temperature in (1e-6, 1e-3, 1e3, 1e6):
+            with self.subTest(temperature=temperature):
+                loss = F.info_nce_loss(query, positive_key, temperature=temperature)
+                self.assertTrue(torch.isfinite(loss))
 
+    def test_zero_vectors_do_not_produce_nan(self):
+        loss = F.info_nce_loss(torch.zeros(8, 16), torch.zeros(8, 16))
+        self.assertFalse(torch.isnan(loss))
 
-class TestInfoNCELossBehavior:
-    """Behavioral correctness tests."""
+    def test_gradient_stability_with_large_logits(self):
+        query = (torch.randn(8, 32) * 10).requires_grad_(True)
+        positive_key = (torch.randn(8, 32) * 10).requires_grad_(True)
+        F.info_nce_loss(query, positive_key, temperature=0.01).backward()
+        self.assertFalse(torch.isnan(query.grad).any())
+        self.assertFalse(torch.isnan(positive_key.grad).any())
 
-    def test_loss_non_negative(self):
-        """Test loss is always non-negative."""
-        for _ in range(10):
-            query = torch.randn(32, 64)
-            positive_key = torch.randn(32, 64)
-            loss = info_nce_loss(query, positive_key)
-            assert loss.item() >= 0
+    # -- invariances ------------------------------------------------------
+    def test_invariant_to_input_rescaling(self):
+        """L2 normalization makes the loss scale invariant."""
+        query, positive_key = torch.randn(8, 16), torch.randn(8, 16)
+        self.assertEqual(
+            F.info_nce_loss(query, positive_key),
+            F.info_nce_loss(query * 3, positive_key * 11),
+        )
 
-    def test_loss_decreases_with_similarity(self):
-        """Test loss is lower when positives are more similar."""
-        torch.manual_seed(123)
-        query = torch.randn(16, 64)
-
-        # High similarity: positive is close to query
-        positive_similar = query + torch.randn_like(query) * 0.1
-        loss_similar = info_nce_loss(query, positive_similar)
-
-        # Low similarity: positive is random
-        positive_random = torch.randn(16, 64)
-        loss_random = info_nce_loss(query, positive_random)
-
-        assert loss_similar.item() < loss_random.item()
-
-    def test_perfect_similarity_low_loss(self):
-        """Test that identical embeddings give low loss."""
-        query = torch.randn(16, 64)
-        positive_key = query.clone()  # Identical
-        loss = info_nce_loss(query, positive_key)
-        # Loss should be relatively low (depends on negatives)
-        assert loss.item() < 5.0  # Reasonable upper bound
-
-
-class TestInfoNCELossTorchCompile:
-    """torch.compile compatibility tests."""
-
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
-    def test_compile_functional(self):
-        """Test functional API works with torch.compile."""
-        # Use eager backend for portability (avoids C++ compiler issues)
-        compiled_loss = torch.compile(info_nce_loss, backend="eager")
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-
-        loss_regular = info_nce_loss(query, positive_key)
-        loss_compiled = compiled_loss(query, positive_key)
-
-        assert torch.allclose(loss_regular, loss_compiled, atol=1e-5)
-
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
-    def test_compile_module(self):
-        """Test module works with torch.compile."""
-        loss_fn = InfoNCELoss()
-        compiled_fn = torch.compile(loss_fn, backend="eager")
-        query = torch.randn(16, 64)
-        positive_key = torch.randn(16, 64)
-
-        loss_regular = loss_fn(query, positive_key)
-        loss_compiled = compiled_fn(query, positive_key)
-
-        assert torch.allclose(loss_regular, loss_compiled, atol=1e-5)
-
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
-    def test_compile_with_negatives(self):
-        """Test torch.compile with explicit negatives."""
-        compiled_loss = torch.compile(info_nce_loss, backend="eager")
-        query = torch.randn(8, 32)
-        positive_key = torch.randn(8, 32)
-        negative_keys = torch.randn(64, 32)
-
-        loss_regular = info_nce_loss(query, positive_key, negative_keys)
-        loss_compiled = compiled_loss(query, positive_key, negative_keys)
-
-        assert torch.allclose(loss_regular, loss_compiled, atol=1e-5)
-
-
-class TestInfoNCELossDevice:
-    """Device compatibility tests."""
-
-    def test_cpu(self):
-        """Test on CPU."""
-        query = torch.randn(16, 64, device="cpu")
-        positive_key = torch.randn(16, 64, device="cpu")
-        loss = info_nce_loss(query, positive_key)
-        assert loss.device.type == "cpu"
-
-    @pytest.mark.skipif(
-        not torch.backends.mps.is_available(), reason="MPS not available"
-    )
-    def test_mps(self):
-        """Test on MPS (Apple Silicon)."""
-        device = torch.device("mps")
-        query = torch.randn(16, 64, device=device)
-        positive_key = torch.randn(16, 64, device=device)
-        loss = info_nce_loss(query, positive_key)
-        assert loss.device.type == "mps"
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda(self):
-        """Test on CUDA."""
-        device = torch.device("cuda")
-        query = torch.randn(16, 64, device=device)
-        positive_key = torch.randn(16, 64, device=device)
-        loss = info_nce_loss(query, positive_key)
-        assert loss.device.type == "cuda"
-
-
-class TestInfoNCELossModuleAttributes:
-    """Test module attributes and JIT compatibility."""
-
-    def test_constants_defined(self):
-        """Test __constants__ is defined for JIT."""
-        assert hasattr(InfoNCELoss, "__constants__")
-        assert "temperature" in InfoNCELoss.__constants__
-        assert "reduction" in InfoNCELoss.__constants__
-
-    def test_repr(self):
-        """Test module repr."""
-        loss_fn = InfoNCELoss(temperature=0.1, reduction="sum")
-        repr_str = repr(loss_fn)
-        assert "InfoNCELoss" in repr_str
-
-    def test_module_inheritance(self):
-        """Test proper inheritance."""
-        from torch.nn.modules.loss import _Loss
-
-        loss_fn = InfoNCELoss()
-        assert isinstance(loss_fn, _Loss)
-        assert isinstance(loss_fn, torch.nn.Module)
-
-
-class TestInfoNCELossSymmetric:
-    """Test symmetric / bidirectional InfoNCE (CLIP style)."""
+    def test_inputs_are_not_mutated(self):
+        query, positive_key = torch.randn(8, 16), torch.randn(8, 16)
+        negative_keys = torch.randn(20, 16)
+        originals = [t.clone() for t in (query, positive_key, negative_keys)]
+        F.info_nce_loss(query, positive_key, negative_keys)
+        for tensor, original in zip(
+            (query, positive_key, negative_keys), originals, strict=True
+        ):
+            self.assertEqual(tensor, original)
 
     def test_symmetric_loss(self):
-        """Test bidirectional InfoNCE computation."""
+        """CLIP-style bidirectional InfoNCE."""
         query = torch.randn(16, 64, requires_grad=True)
         key = torch.randn(16, 64, requires_grad=True)
+        loss = 0.5 * (F.info_nce_loss(query, key) + F.info_nce_loss(key, query))
+        self.assertGreaterEqual(loss.item(), 0)
+        loss.backward()
+        self.assertIsNotNone(query.grad)
+        self.assertIsNotNone(key.grad)
 
-        loss_q2k = info_nce_loss(query, key)
-        loss_k2q = info_nce_loss(key, query)
-        sym_loss = 0.5 * (loss_q2k + loss_k2q)
+    # -- dtypes -----------------------------------------------------------
+    def test_dtype_is_preserved(self):
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                query = torch.randn(8, 16, dtype=dtype)
+                positive_key = torch.randn(8, 16, dtype=dtype)
+                self.assertEqual(F.info_nce_loss(query, positive_key).dtype, dtype)
 
-        assert sym_loss.shape == ()
-        assert sym_loss.item() >= 0
-        sym_loss.backward()
-        assert query.grad is not None
-        assert key.grad is not None
+    def test_low_precision_dtypes(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                query = torch.randn(16, 32, dtype=dtype)
+                positive_key = torch.randn(16, 32, dtype=dtype)
+                self.assertTrue(torch.isfinite(F.info_nce_loss(query, positive_key)))
 
+    # -- module plumbing --------------------------------------------------
+    def test_module_attributes(self):
+        self.assertIn("temperature", nn.InfoNCELoss.__constants__)
+        self.assertIn("reduction", nn.InfoNCELoss.__constants__)
+        loss_fn = nn.InfoNCELoss(temperature=0.1, reduction="sum")
+        self.assertIn("InfoNCELoss", repr(loss_fn))
+        self.assertIsInstance(loss_fn, nn.Module)
+        self.assertEqual(list(loss_fn.parameters()), [])
 
-class TestInfoNCELossJIT:
-    """Test TorchScript compatibility."""
+    def test_module_matches_functional_for_all_reductions(self):
+        query, positive_key = torch.randn(10, 20), torch.randn(10, 20)
+        for temperature in (0.05, 0.5):
+            for reduction in ("none", "mean", "sum"):
+                with self.subTest(temperature=temperature, reduction=reduction):
+                    loss_fn = nn.InfoNCELoss(
+                        temperature=temperature, reduction=reduction
+                    )
+                    self.assertEqual(
+                        loss_fn(query, positive_key),
+                        F.info_nce_loss(
+                            query,
+                            positive_key,
+                            temperature=temperature,
+                            reduction=reduction,
+                        ),
+                    )
 
-    def test_jit_script_module(self):
-        """Test that InfoNCELoss can be scripted."""
-        loss_fn = InfoNCELoss(temperature=0.07)
-        scripted = torch.jit.script(loss_fn)
-        query = torch.randn(8, 64)
-        positive_key = torch.randn(8, 64)
-        loss = scripted(query, positive_key)
-        assert loss.shape == ()
-        assert loss.item() >= 0
+    def test_deepcopy_and_state_dict(self):
+        import copy
 
-    def test_jit_script_with_negatives(self):
-        """Test scripted module with explicit negatives."""
-        loss_fn = InfoNCELoss(temperature=0.1)
-        scripted = torch.jit.script(loss_fn)
-        query = torch.randn(8, 64)
-        positive_key = torch.randn(8, 64)
-        negative_keys = torch.randn(32, 64)
-        loss = scripted(query, positive_key, negative_keys)
-        assert loss.shape == ()
-        assert loss.item() >= 0
+        loss_fn = nn.InfoNCELoss(temperature=0.33)
+        self.assertEqual(copy.deepcopy(loss_fn).temperature, 0.33)
+        other = nn.InfoNCELoss()
+        other.load_state_dict(loss_fn.state_dict())
+        self.assertEqual(loss_fn.state_dict(), other.state_dict())
 
-    def test_jit_script_gradient(self):
-        """Test that gradients flow through scripted module."""
-        loss_fn = InfoNCELoss(temperature=0.07)
-        scripted = torch.jit.script(loss_fn)
+    # -- scripting and compilation ----------------------------------------
+    def test_torchscript(self):
+        scripted = torch.jit.script(nn.InfoNCELoss(temperature=0.07))
         query = torch.randn(8, 64, requires_grad=True)
         positive_key = torch.randn(8, 64)
         loss = scripted(query, positive_key)
+        self.assertEqual(loss, F.info_nce_loss(query, positive_key, temperature=0.07))
         loss.backward()
-        assert query.grad is not None
-        assert query.grad.shape == query.shape
+        self.assertEqual(query.grad.shape, query.shape)
+
+    def test_torchscript_with_negatives(self):
+        scripted = torch.jit.script(nn.InfoNCELoss(temperature=0.1))
+        query, positive_key = torch.randn(8, 64), torch.randn(8, 64)
+        negative_keys = torch.randn(32, 64)
+        self.assertEqual(
+            scripted(query, positive_key, negative_keys),
+            F.info_nce_loss(query, positive_key, negative_keys, temperature=0.1),
+        )
+
+    def test_compile_fullgraph(self):
+        compiled = torch.compile(F.info_nce_loss, fullgraph=True, backend="eager")
+        query, positive_key = torch.randn(16, 32), torch.randn(16, 32)
+        self.assertEqual(
+            compiled(query, positive_key), F.info_nce_loss(query, positive_key)
+        )
+
+    def test_compile_module(self):
+        loss_fn = nn.InfoNCELoss()
+        compiled = torch.compile(loss_fn, fullgraph=True, backend="eager")
+        query, positive_key = torch.randn(16, 64), torch.randn(16, 64)
+        self.assertEqual(compiled(query, positive_key), loss_fn(query, positive_key))
+
+    def test_compile_dynamic_shapes(self):
+        compiled = torch.compile(F.info_nce_loss, dynamic=True, backend="eager")
+        for batch_size in (8, 16, 32):
+            with self.subTest(batch_size=batch_size):
+                query = torch.randn(batch_size, 24)
+                positive_key = torch.randn(batch_size, 24)
+                self.assertEqual(
+                    compiled(query, positive_key),
+                    F.info_nce_loss(query, positive_key),
+                )
+
+    def test_compile_backward(self):
+        compiled = torch.compile(F.info_nce_loss, backend="eager")
+        query = torch.randn(8, 16, requires_grad=True)
+        compiled(query, torch.randn(8, 16)).backward()
+        self.assertFalse(torch.isnan(query.grad).any())
+
+
+class TestInfoNCELossDevice(TestCase):
+    """Device-parameterized coverage."""
+
+    def test_device_of_output_matches_input(self, device):
+        query = torch.randn(16, 64, device=device)
+        positive_key = torch.randn(16, 64, device=device)
+        loss = F.info_nce_loss(query, positive_key)
+        self.assertEqual(loss.device.type, torch.device(device).type)
+
+    def test_gradient_on_device(self, device):
+        query = torch.randn(8, 32, device=device, requires_grad=True)
+        positive_key = torch.randn(8, 32, device=device)
+        F.info_nce_loss(query, positive_key).backward()
+        self.assertIsNotNone(query.grad)
+        self.assertFalse(torch.isnan(query.grad).any())
+
+    @onlyCPU
+    def test_cpu_double_precision(self, device):
+        query = torch.randn(8, 16, device=device, dtype=torch.double)
+        positive_key = torch.randn(8, 16, device=device, dtype=torch.double)
+        self.assertEqual(F.info_nce_loss(query, positive_key).dtype, torch.double)
+
+
+instantiate_device_type_tests(TestInfoNCELossDevice, globals())
+
+
+if __name__ == "__main__":
+    run_tests()

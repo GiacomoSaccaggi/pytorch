@@ -6133,13 +6133,19 @@ def info_nce_loss(
         positive_key: Positive embeddings of shape :math:`(N, D)`, paired with query.
         negative_keys: Optional explicit negatives of shape :math:`(M, D)`.
             If ``None``, uses other samples in batch as negatives.
-        temperature: Temperature scaling parameter :math:`\tau`. Default: ``0.07``.
+        temperature: Temperature scaling parameter :math:`\tau`. Must be positive.
+            Default: ``0.07``.
         reduction (str, optional): Specifies the reduction to apply to the output:
             ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
 
     Returns:
         InfoNCE loss. Scalar if reduction is ``'mean'`` or ``'sum'``,
         tensor of shape :math:`(N,)` if ``'none'``.
+
+    .. note::
+        With ``negative_keys=None`` and a batch of one, no negatives exist, so the
+        loss is exactly ``0``. Gradients still flow (they are zero), so calling
+        ``backward()`` is safe.
 
     Examples::
 
@@ -6169,6 +6175,9 @@ def info_nce_loss(
     if reduction not in ("none", "mean", "sum"):
         raise ValueError(f"{reduction} is not a valid value for reduction")
 
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+
     if query.dim() != 2 or positive_key.dim() != 2:
         raise ValueError(
             f"query and positive_key must be 2D tensors, "
@@ -6182,12 +6191,6 @@ def info_nce_loss(
         )
 
     batch_size = query.shape[0]
-
-    # Handle batch size 1 edge case (no negatives available)
-    if batch_size == 1 and negative_keys is None:
-        if reduction == "none":
-            return query.new_zeros(1)
-        return query.new_zeros(())
 
     # L2 normalize embeddings
     query = normalize(query, p=2.0, dim=1)
@@ -6205,7 +6208,9 @@ def info_nce_loss(
             )
         negative_keys = normalize(negative_keys, p=2.0, dim=1)
         # Positive similarities: (N, 1)
-        positive_sim = torch.sum(query * positive_key, dim=1, keepdim=True) / temperature
+        positive_sim = (
+            torch.sum(query * positive_key, dim=1, keepdim=True) / temperature
+        )
         # Negative similarities: (N, M)
         negative_sim = torch.mm(query, negative_keys.t()) / temperature
         # All logits: (N, 1 + M), positive in column 0
@@ -6213,8 +6218,9 @@ def info_nce_loss(
         targets = torch.zeros(batch_size, dtype=torch.long, device=query.device)
         return cross_entropy(logits, targets, reduction=reduction)
     else:
-        # SimCLR-style: other samples in batch are negatives
-        # Similarity matrix: (N, N) where diagonal is positive pair and off-diagonals are negatives
+        # SimCLR-style: other samples in batch are negatives. The similarity
+        # matrix (N, N) holds positive pairs on the diagonal and negatives
+        # off-diagonal, so the target for row i is simply i.
         all_sim = torch.mm(query, positive_key.t()) / temperature
         targets = torch.arange(batch_size, device=query.device)
         return cross_entropy(all_sim, targets, reduction=reduction)
@@ -6233,8 +6239,11 @@ def sup_con_loss(
     Extends InfoNCE to the supervised setting where labels define positive pairs.
     Samples with the same label are treated as positives, all others as negatives.
     When neither ``labels`` nor ``mask`` is provided:
-    - for 3D features :math:`(N, \text{n\_views}, D)`, different views of the same sample are treated as positives (SimCLR-style self-supervised mode);
-    - for 2D features :math:`(N, D)`, each sample is its own single class and has no other positives (returns 0).
+
+    - for 3D features :math:`(N, \text{n\_views}, D)`, different views of the same
+      sample are treated as positives (SimCLR-style self-supervised mode);
+    - for 2D features :math:`(N, D)`, each sample is its own single class and has
+      no other positives (returns 0).
 
     The loss for anchor :math:`i` is:
 
@@ -6252,13 +6261,21 @@ def sup_con_loss(
         labels: Integer class labels of shape :math:`(N,)`. Default: ``None``.
         mask: Binary mask of shape :math:`(N, N)` or :math:`(N \times \text{n\_views}, N \times \text{n\_views})`
             defining positive pairs. Cannot specify both ``labels`` and ``mask``. Default: ``None``.
-        temperature: Temperature parameter :math:`\tau`. Default: ``0.1``.
-        base_temperature: Base temperature for loss scaling. Default: ``0.07``.
+        temperature: Temperature parameter :math:`\tau`. Must be positive.
+            Default: ``0.1``.
+        base_temperature: Base temperature for loss scaling. Must be positive.
+            Default: ``0.07``.
         reduction (str, optional): ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
 
     Returns:
         Supervised contrastive loss. Scalar if reduction is ``'mean'`` or ``'sum'``,
         tensor of shape :math:`(N,)` (for 2D inputs) or :math:`(N, \text{n\_views})` (for 3D inputs) if ``'none'``.
+
+    .. note::
+        Anchors with no positive pairs contribute exactly ``0`` and are excluded
+        from the ``'mean'`` denominator, so ``'mean'`` averages only over anchors
+        that have at least one positive. Gradients stay finite in every case, and
+        ``backward()`` is safe even when no anchor has a positive.
 
     Examples::
 
@@ -6289,10 +6306,20 @@ def sup_con_loss(
     if reduction not in ("none", "mean", "sum"):
         raise ValueError(f"{reduction} is not a valid value for reduction")
 
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+
+    if base_temperature <= 0:
+        raise ValueError(f"base_temperature must be positive, got {base_temperature}")
+
     if labels is not None and mask is not None:
         raise ValueError("Cannot specify both labels and mask")
 
     is_multiview = features.dim() == 3
+    # Defined for both paths so the final reshape is well typed; a 2D input is
+    # equivalent to a single view per sample.
+    batch_size = features.shape[0]
+    n_views = 1
     if is_multiview:
         batch_size, n_views, dim = features.shape
         if n_views < 1 or dim < 1:
@@ -6307,7 +6334,9 @@ def sup_con_loss(
             labels = labels.contiguous().view(-1, 1).repeat(1, n_views).view(-1)
         elif mask is not None:
             if mask.shape == (batch_size, batch_size):
-                mask = mask.repeat_interleave(n_views, dim=0).repeat_interleave(n_views, dim=1)
+                mask = mask.repeat_interleave(n_views, dim=0).repeat_interleave(
+                    n_views, dim=1
+                )
             elif mask.shape != (batch_size * n_views, batch_size * n_views):
                 raise ValueError(
                     f"mask must have shape ({batch_size}, {batch_size}) or "
@@ -6340,62 +6369,51 @@ def sup_con_loss(
                 f"labels must have shape ({total_samples},), got {labels.shape}"
             )
         labels_col = labels.contiguous().view(-1, 1)
-        pos_mask = torch.eq(labels_col, labels_col.t()).float()
+        pos_mask = torch.eq(labels_col, labels_col.t()).to(features.dtype)
     elif mask is not None:
         if mask.shape != (total_samples, total_samples):
             raise ValueError(
-                f"mask must have shape ({total_samples}, {total_samples}), got {mask.shape}"
+                f"mask must have shape ({total_samples}, {total_samples}), "
+                f"got {mask.shape}"
             )
-        pos_mask = mask.float()
+        pos_mask = mask.to(features.dtype)
     else:
         # Self-supervised 2D: each sample is its own class (identity mask)
-        pos_mask = torch.eye(total_samples, device=device)
+        pos_mask = torch.eye(total_samples, dtype=features.dtype, device=device)
 
     # Remove self-contrast (diagonal)
     self_mask = ~torch.eye(total_samples, dtype=torch.bool, device=device)
-    pos_mask = pos_mask * self_mask.float()
-
-    # Handle batch size 1 or no samples
-    if total_samples == 1:
-        if reduction == "none":
-            return features.new_zeros((1, 1) if is_multiview else 1)
-        return features.new_zeros(())
+    pos_mask = pos_mask * self_mask.to(pos_mask.dtype)
 
     # Count positives per anchor
     num_positives = pos_mask.sum(dim=1)
 
-    # Numerical stability: subtract max over non-self similarities
-    similarity_for_max = similarity.masked_fill(~self_mask, float("-inf"))
-    sim_max, _ = torch.max(similarity_for_max, dim=1, keepdim=True)
-    sim_max = torch.where(
-        torch.isinf(sim_max), torch.zeros_like(sim_max), sim_max
-    )
-    similarity = similarity - sim_max.detach()
-
-    # Log-sum-exp over non-self samples (denominator)
+    # Log-sum-exp over non-self samples (denominator). torch.logsumexp is
+    # internally stabilized by subtracting the row max, so no manual shift is
+    # needed here.
     similarity_for_lse = similarity.masked_fill(~self_mask, float("-inf"))
     log_sum_exp = torch.logsumexp(similarity_for_lse, dim=1, keepdim=True)
 
-    # Log probabilities
+    # Log probabilities. An anchor with no comparable sample (total_samples == 1)
+    # has an all -inf denominator, making log_prob non-finite; such entries are
+    # never positives, so select zeros instead of forming 0 * inf = NaN.
     log_prob = similarity - log_sum_exp
+    log_prob = torch.where(self_mask, log_prob, torch.zeros_like(log_prob))
 
-    # Avoid division by zero for samples with no positives
-    pos_mask_safe = pos_mask.clone()
-    num_positives_safe = num_positives.clone()
+    # Mean log_prob over positives, guarding anchors that have none
     no_positives = num_positives == 0
-    num_positives_safe[no_positives] = 1.0
+    num_positives_safe = num_positives.clamp(min=1)
+    mean_log_prob = (pos_mask * log_prob).sum(dim=1) / num_positives_safe
 
-    # Mean log_prob over positives for each anchor
-    mean_log_prob = (pos_mask_safe * log_prob).sum(dim=1) / num_positives_safe
-
-    # Loss with temperature scaling
+    # Loss with temperature scaling; anchors without positives contribute zero
     loss = -(temperature / base_temperature) * mean_log_prob
-    loss = loss * (~no_positives).float()
+    loss = torch.where(no_positives, torch.zeros_like(loss), loss)
 
     if reduction == "mean":
-        valid_count = (~no_positives).sum()
-        if valid_count == 0:
-            return loss.new_zeros(())
+        # Average over anchors that actually have positives. clamp(min=1) keeps
+        # this branchless (and torch.compile fullgraph-safe); when no anchor is
+        # valid the numerator is already zero, so the result is zero.
+        valid_count = (~no_positives).sum().clamp(min=1)
         return loss.sum() / valid_count
     elif reduction == "sum":
         return loss.sum()

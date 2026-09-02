@@ -1,490 +1,615 @@
-"""Comprehensive tests for SupConLoss."""
+# Owner(s): ["module: nn"]
 
-import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+    onlyCPU,
+)
+from torch.testing._internal.common_utils import (
+    gradcheck,
+    gradgradcheck,
+    run_tests,
+    TestCase,
+)
 
-from torch.nn import SupConLoss, sup_con_loss
 
+class TestSupConLoss(TestCase):
+    """Tests for nn.SupConLoss / F.sup_con_loss."""
 
-class TestSupConLossBasic:
-    """Basic functionality tests."""
+    def _reference(self, features, labels, temperature, base_temperature):
+        """Independent reference: Khosla et al. Eq. (2), L_out, via python loops."""
+        normalized = F.normalize(features, dim=1)
+        n = normalized.shape[0]
+        similarity = normalized @ normalized.t() / temperature
+        out = torch.zeros(n, dtype=features.dtype)
+        for i in range(n):
+            positives = [j for j in range(n) if j != i and labels[j] == labels[i]]
+            if not positives:
+                continue
+            others = torch.stack([similarity[i, a] for a in range(n) if a != i])
+            log_sum_exp = torch.logsumexp(others, 0)
+            total = sum(similarity[i, p] - log_sum_exp for p in positives)
+            out[i] = -(temperature / base_temperature) * (total / len(positives))
+        return out
 
+    # -- basic ------------------------------------------------------------
     def test_forward_with_labels(self):
-        """Test basic forward pass with labels."""
         features = torch.randn(32, 128)
         labels = torch.randint(0, 10, (32,))
-        loss = sup_con_loss(features, labels=labels)
-        assert loss.shape == ()
-        assert loss.item() >= 0
+        loss = F.sup_con_loss(features, labels=labels)
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertGreaterEqual(loss.item(), 0)
+        self.assertEqual(nn.SupConLoss(temperature=0.1)(features, labels=labels), loss)
 
-    def test_module_forward_with_labels(self):
-        """Test module API forward pass with labels."""
-        loss_fn = SupConLoss(temperature=0.1)
-        features = torch.randn(32, 128)
-        labels = torch.randint(0, 10, (32,))
-        loss = loss_fn(features, labels=labels)
-        assert loss.shape == ()
-        assert loss.item() >= 0
-
-    def test_forward_with_mask(self):
-        """Test forward pass with custom mask."""
+    def test_forward_with_mask_matches_labels(self):
         features = torch.randn(16, 64)
-        # Create a mask where samples 0-3, 4-7, 8-11, 12-15 are positives
         labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3])
         mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
-        loss = sup_con_loss(features, mask=mask)
-        assert loss.shape == ()
-        assert loss.item() >= 0
+        self.assertEqual(
+            F.sup_con_loss(features, mask=mask),
+            F.sup_con_loss(features, labels=labels),
+        )
 
-    def test_self_supervised_mode(self):
-        """Test self-supervised mode (no labels or mask)."""
-        features = torch.randn(16, 64)
-        loss = sup_con_loss(features)
-        assert loss.shape == ()
-        # In self-supervised mode, each sample is its own class
-        # So there are no positives (other than self which is excluded)
-        # Loss should be 0 for all samples
-        assert loss.item() == 0.0
+    def test_self_supervised_2d_has_no_positives(self):
+        """Each 2D sample is its own class, so there are no positive pairs."""
+        loss = F.sup_con_loss(torch.randn(16, 64))
+        self.assertEqual(loss.item(), 0.0)
 
+    # -- correctness against the reference --------------------------------
+    def test_matches_reference(self):
+        for temperature, base in ((0.1, 0.07), (0.5, 0.5), (0.07, 1.0)):
+            with self.subTest(temperature=temperature, base_temperature=base):
+                features = torch.randn(20, 32)
+                labels = torch.randint(0, 5, (20,))
+                self.assertEqual(
+                    F.sup_con_loss(
+                        features,
+                        labels=labels,
+                        temperature=temperature,
+                        base_temperature=base,
+                        reduction="none",
+                    ),
+                    self._reference(features, labels, temperature, base),
+                )
 
-class TestSupConLossGradient:
-    """Gradient computation tests."""
+    def test_matches_reference_when_all_labels_equal(self):
+        features = torch.randn(12, 16)
+        labels = torch.zeros(12, dtype=torch.long)
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels, reduction="none"),
+            self._reference(features, labels, 0.1, 0.07),
+        )
 
-    def test_gradient_flow_with_labels(self):
-        """Test gradients flow correctly with labels."""
-        features = torch.randn(16, 64, requires_grad=True)
-        labels = torch.randint(0, 4, (16,))  # 4 classes to ensure some positives
-        loss = sup_con_loss(features, labels=labels)
-        loss.backward()
-        assert features.grad is not None
-        assert not torch.isnan(features.grad).any()
+    def test_loss_decreases_with_intra_class_similarity(self):
+        torch.manual_seed(123)
+        labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        base = torch.randn(1, 64)
+        clustered = torch.cat([base + torch.randn(4, 64) * 0.1, torch.randn(4, 64)])
+        self.assertLess(
+            F.sup_con_loss(clustered, labels=labels).item(),
+            F.sup_con_loss(torch.randn(8, 64), labels=labels).item(),
+        )
 
-    def test_gradient_flow_with_mask(self):
-        """Test gradients flow correctly with mask."""
-        features = torch.randn(16, 64, requires_grad=True)
-        mask = torch.zeros(16, 16)
-        # Create some positive pairs
-        mask[0, 1] = mask[1, 0] = 1
-        mask[2, 3] = mask[3, 2] = 1
-        loss = sup_con_loss(features, mask=mask)
-        loss.backward()
-        assert features.grad is not None
-        assert not torch.isnan(features.grad).any()
-
-
-class TestSupConLossReduction:
-    """Test different reduction modes."""
-
-    def test_reduction_none(self):
-        """Test reduction='none' returns per-sample losses."""
-        features = torch.randn(16, 64)
-        labels = torch.randint(0, 4, (16,))
-        loss = sup_con_loss(features, labels=labels, reduction="none")
-        assert loss.shape == (16,)
-        assert (loss >= 0).all()
-
-    def test_reduction_mean(self):
-        """Test reduction='mean' returns scalar mean over valid samples."""
+    # -- reduction --------------------------------------------------------
+    def test_reduction_none_shape_and_sign(self):
         features = torch.randn(16, 64)
         labels = torch.randint(0, 4, (16,))
-        loss_none = sup_con_loss(features, labels=labels, reduction="none")
-        loss_mean = sup_con_loss(features, labels=labels, reduction="mean")
-        assert loss_mean.shape == ()
-        # Mean should be over samples that have positives
-        valid_mask = loss_none > 0
-        if valid_mask.any():
-            expected_mean = loss_none[valid_mask].mean()
-            # Allow some tolerance for numerical differences
-            assert torch.allclose(loss_mean, expected_mean, atol=1e-5) or loss_mean.item() >= 0
+        loss = F.sup_con_loss(features, labels=labels, reduction="none")
+        self.assertEqual(loss.shape, torch.Size([16]))
+        self.assertTrue((loss >= 0).all())
+
+    def test_mean_averages_only_over_anchors_with_positives(self):
+        torch.manual_seed(9)
+        features = torch.randn(10, 16)
+        labels = torch.tensor([0, 0, 1, 1, 2, 3, 4, 5, 6, 7])  # 4 valid anchors
+        unreduced = F.sup_con_loss(features, labels=labels, reduction="none")
+        valid_count = (unreduced != 0).sum()
+        self.assertEqual(valid_count.item(), 4)
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels, reduction="mean"),
+            unreduced.sum() / valid_count,
+        )
 
     def test_reduction_sum(self):
-        """Test reduction='sum' returns scalar sum."""
         features = torch.randn(16, 64)
         labels = torch.randint(0, 4, (16,))
-        loss_none = sup_con_loss(features, labels=labels, reduction="none")
-        loss_sum = sup_con_loss(features, labels=labels, reduction="sum")
-        assert loss_sum.shape == ()
-        assert torch.allclose(loss_sum, loss_none.sum())
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels, reduction="sum"),
+            F.sup_con_loss(features, labels=labels, reduction="none").sum(),
+        )
 
-    def test_invalid_reduction(self):
-        """Test invalid reduction raises error."""
+    def test_invalid_reduction_raises(self):
         features = torch.randn(8, 32)
         labels = torch.randint(0, 4, (8,))
-        with pytest.raises(ValueError, match="Invalid reduction"):
-            sup_con_loss(features, labels=labels, reduction="invalid")
+        with self.assertRaisesRegex(ValueError, "not a valid value for reduction"):
+            F.sup_con_loss(features, labels=labels, reduction="invalid")
 
+    # -- temperature ------------------------------------------------------
+    def test_temperatures_must_be_positive(self):
+        features = torch.randn(8, 32)
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        for temperature in (0.0, -0.1):
+            with self.subTest(temperature=temperature):
+                with self.assertRaisesRegex(ValueError, "temperature must be positive"):
+                    F.sup_con_loss(features, labels=labels, temperature=temperature)
+        for base in (0.0, -0.1):
+            with self.subTest(base_temperature=base):
+                with self.assertRaisesRegex(
+                    ValueError, "base_temperature must be positive"
+                ):
+                    F.sup_con_loss(features, labels=labels, base_temperature=base)
 
-class TestSupConLossTemperature:
-    """Test temperature parameter effects."""
-
-    def test_different_temperatures(self):
-        """Test loss varies with temperature."""
+    def test_temperature_and_base_temperature_affect_loss(self):
         torch.manual_seed(42)
         features = torch.randn(16, 64)
         labels = torch.randint(0, 4, (16,))
-
-        loss_low_temp = sup_con_loss(features, labels=labels, temperature=0.01)
-        loss_high_temp = sup_con_loss(features, labels=labels, temperature=1.0)
-
-        # Losses should differ
-        assert loss_low_temp.item() != loss_high_temp.item()
-
-    def test_base_temperature_scaling(self):
-        """Test base_temperature affects loss scaling."""
-        features = torch.randn(16, 64)
-        labels = torch.randint(0, 4, (16,))
-
-        loss_base_07 = sup_con_loss(
-            features, labels=labels, temperature=0.1, base_temperature=0.07
+        self.assertNotEqual(
+            F.sup_con_loss(features, labels=labels, temperature=0.01).item(),
+            F.sup_con_loss(features, labels=labels, temperature=1.0).item(),
         )
-        loss_base_01 = sup_con_loss(
-            features, labels=labels, temperature=0.1, base_temperature=0.1
+        self.assertNotEqual(
+            F.sup_con_loss(
+                features, labels=labels, temperature=0.1, base_temperature=0.07
+            ).item(),
+            F.sup_con_loss(
+                features, labels=labels, temperature=0.1, base_temperature=0.1
+            ).item(),
         )
 
-        # Different base temperatures should give different losses
-        # (due to scaling factor temperature/base_temperature)
-        assert loss_base_07.item() != loss_base_01.item()
+    def test_module_stores_temperatures(self):
+        loss_fn = nn.SupConLoss(temperature=0.5, base_temperature=0.1)
+        self.assertEqual(loss_fn.temperature, 0.5)
+        self.assertEqual(loss_fn.base_temperature, 0.1)
 
-    def test_temperature_in_module(self):
-        """Test module stores temperature correctly."""
-        loss_fn = SupConLoss(temperature=0.5, base_temperature=0.1)
-        assert loss_fn.temperature == 0.5
-        assert loss_fn.base_temperature == 0.1
+    # -- gradients --------------------------------------------------------
+    def test_gradient_flow_with_labels_and_mask(self):
+        features = torch.randn(16, 64, requires_grad=True)
+        F.sup_con_loss(features, labels=torch.randint(0, 4, (16,))).backward()
+        self.assertFalse(torch.isnan(features.grad).any())
 
+        features = torch.randn(16, 64, requires_grad=True)
+        mask = torch.zeros(16, 16)
+        mask[0, 1] = mask[1, 0] = mask[2, 3] = mask[3, 2] = 1
+        F.sup_con_loss(features, mask=mask).backward()
+        self.assertFalse(torch.isnan(features.grad).any())
 
-class TestSupConLossEdgeCases:
-    """Edge case handling tests."""
+    def test_gradcheck(self):
+        features = torch.randn(8, 6, dtype=torch.double, requires_grad=True)
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 0, 1])
+        self.assertTrue(
+            gradcheck(
+                lambda x: F.sup_con_loss(x, labels=labels, temperature=0.5), (features,)
+            )
+        )
 
-    def test_batch_size_one(self):
-        """Test batch size 1 returns zero."""
-        features = torch.randn(1, 32)
-        labels = torch.tensor([0])
-        loss = sup_con_loss(features, labels=labels)
-        assert loss.item() == 0.0
+    def test_gradgradcheck(self):
+        features = torch.randn(6, 5, dtype=torch.double, requires_grad=True)
+        labels = torch.tensor([0, 0, 1, 1, 2, 2])
+        self.assertTrue(
+            gradgradcheck(
+                lambda x: F.sup_con_loss(x, labels=labels, temperature=0.5), (features,)
+            )
+        )
+
+    def test_no_positives_is_zero_and_differentiable(self):
+        """Every label unique: loss is 0 but backward() must still work."""
+        features = torch.randn(6, 8, requires_grad=True)
+        loss = F.sup_con_loss(features, labels=torch.arange(6))
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+        self.assertIsNotNone(features.grad)
+        self.assertEqual(features.grad, torch.zeros_like(features.grad))
+
+    def test_partial_positives_gradient(self):
+        features = torch.randn(8, 32, requires_grad=True)
+        labels = torch.tensor([0, 0, 2, 3, 4, 5, 6, 7])
+        loss = F.sup_con_loss(features, labels=labels)
+        self.assertGreaterEqual(loss.item(), 0)
+        loss.backward()
+        self.assertFalse(torch.isnan(features.grad).any())
+
+    def test_optimization_reduces_loss(self):
+        torch.manual_seed(32)
+        encoder = nn.Linear(32, 16)
+        optimizer = torch.optim.Adam(encoder.parameters(), lr=0.05)
+        inputs = torch.randn(32, 32)
+        labels = torch.randint(0, 4, (32,))
+        losses = []
+        for _ in range(60):
+            loss = F.sup_con_loss(encoder(inputs), labels=labels, temperature=0.2)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+        self.assertLess(losses[-1], losses[0])
+
+    # -- edge cases -------------------------------------------------------
+    def test_batch_size_one_is_zero_and_differentiable(self):
+        features = torch.randn(1, 32, requires_grad=True)
+        loss = F.sup_con_loss(features, labels=torch.tensor([0]))
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+        self.assertIsNotNone(features.grad)
+        self.assertFalse(torch.isnan(features.grad).any())
 
     def test_batch_size_one_reduction_none(self):
-        """Test batch size 1 with reduction='none'."""
-        features = torch.randn(1, 32)
-        labels = torch.tensor([0])
-        loss = sup_con_loss(features, labels=labels, reduction="none")
-        assert loss.shape == (1,)
-        assert loss.item() == 0.0
+        loss = F.sup_con_loss(
+            torch.randn(1, 32), labels=torch.tensor([0]), reduction="none"
+        )
+        self.assertEqual(loss.shape, torch.Size([1]))
+        self.assertEqual(loss.item(), 0.0)
 
-    def test_no_positives_no_nan(self):
-        """Test samples with no positives don't produce NaN."""
-        features = torch.randn(8, 32)
-        features.requires_grad_(True)
-        # All unique labels = no positives for any sample
-        labels = torch.arange(8)
-        loss = sup_con_loss(features, labels=labels)
-        assert not torch.isnan(loss)
-        assert loss.item() == 0.0  # No positives = zero loss
-        
-        # When loss is identically 0 due to no positive pairs, the computation
-        # path may not flow through the input features. This is expected behavior.
-        # We just verify that the loss is computed correctly and is finite.
-        # The gradient test is covered by test_some_samples_no_positives where
-        # some samples DO have positives and thus gradients flow.
-
-    def test_some_samples_no_positives(self):
-        """Test mix of samples with and without positives."""
-        features = torch.randn(8, 32, requires_grad=True)
-        # Samples 0,1 have positives (same label), others don't
-        labels = torch.tensor([0, 0, 2, 3, 4, 5, 6, 7])
-        loss = sup_con_loss(features, labels=labels)
-        assert not torch.isnan(loss)
-        assert loss.item() >= 0
-        loss.backward()
-        assert not torch.isnan(features.grad).any()
+    def test_empty_batch_does_not_crash(self):
+        loss = F.sup_con_loss(torch.randn(0, 16), labels=torch.randint(0, 3, (0,)))
+        self.assertFalse(torch.isnan(loss))
+        self.assertEqual(
+            F.sup_con_loss(
+                torch.randn(0, 16), labels=torch.randint(0, 3, (0,)), reduction="none"
+            ).shape,
+            torch.Size([0]),
+        )
 
     def test_all_same_label(self):
-        """Test when all samples have the same label."""
-        features = torch.randn(8, 32)
-        labels = torch.zeros(8, dtype=torch.long)
-        loss = sup_con_loss(features, labels=labels)
-        assert not torch.isnan(loss)
-        assert loss.item() >= 0
-
-    def test_labels_and_mask_both_specified(self):
-        """Test error when both labels and mask specified."""
-        features = torch.randn(8, 32)
-        labels = torch.randint(0, 4, (8,))
-        mask = torch.eye(8)
-        with pytest.raises(ValueError, match="Cannot specify both"):
-            sup_con_loss(features, labels=labels, mask=mask)
-
-    def test_invalid_features_dim(self):
-        """Test invalid features dimension raises error."""
-        features = torch.randn(8)  # 1D instead of 2D
-        labels = torch.randint(0, 4, (8,))
-        with pytest.raises(ValueError, match="must be 2D"):
-            sup_con_loss(features, labels=labels)
-
-    def test_labels_shape_mismatch(self):
-        """Test labels shape mismatch raises error."""
-        features = torch.randn(8, 32)
-        labels = torch.randint(0, 4, (16,))  # Wrong batch size
-        with pytest.raises(ValueError, match="must have shape"):
-            sup_con_loss(features, labels=labels)
-
-    def test_mask_shape_mismatch(self):
-        """Test mask shape mismatch raises error."""
-        features = torch.randn(8, 32)
-        mask = torch.eye(16)  # Wrong size
-        with pytest.raises(ValueError, match="must have shape"):
-            sup_con_loss(features, mask=mask)
-
-
-class TestSupConLossNumericalStability:
-    """Numerical stability tests."""
-
-    def test_large_embeddings(self):
-        """Test with large embedding values."""
-        features = torch.randn(16, 64) * 100
-        labels = torch.randint(0, 4, (16,))
-        loss = sup_con_loss(features, labels=labels)
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
-
-    def test_small_temperature(self):
-        """Test with very small temperature."""
-        features = torch.randn(16, 64)
-        labels = torch.randint(0, 4, (16,))
-        loss = sup_con_loss(features, labels=labels, temperature=0.001)
-        assert not torch.isnan(loss)
-        assert not torch.isinf(loss)
-
-    def test_gradient_stability_large_logits(self):
-        """Test gradient stability with large logits."""
-        features = torch.randn(16, 32) * 10
-        features.requires_grad_(True)
-        labels = torch.randint(0, 4, (16,))
-        loss = sup_con_loss(features, labels=labels, temperature=0.01)
-        loss.backward()
-        assert features.grad is not None
-        assert not torch.isnan(features.grad).any()
-        assert not torch.isinf(features.grad).any()
-
-
-class TestSupConLossBehavior:
-    """Behavioral correctness tests."""
-
-    def test_loss_non_negative(self):
-        """Test loss is always non-negative."""
-        for _ in range(10):
-            features = torch.randn(32, 64)
-            labels = torch.randint(0, 8, (32,))
-            loss = sup_con_loss(features, labels=labels)
-            assert loss.item() >= 0
-
-    def test_loss_decreases_with_similarity(self):
-        """Test loss is lower when same-class samples are more similar."""
-        torch.manual_seed(123)
-        # Create features where class 0 samples are similar
-        base = torch.randn(1, 64)
-        features_similar = torch.cat(
-            [
-                base + torch.randn(4, 64) * 0.1,  # Class 0: very similar
-                torch.randn(4, 64),  # Class 1: random
-            ]
+        loss = F.sup_con_loss(
+            torch.randn(8, 32), labels=torch.zeros(8, dtype=torch.long)
         )
-        features_random = torch.randn(8, 64)  # All random
-        labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(loss.item(), 0)
 
-        loss_similar = sup_con_loss(features_similar, labels=labels)
-        loss_random = sup_con_loss(features_random, labels=labels)
+    def test_duplicate_identical_rows(self):
+        features = torch.randn(1, 16).repeat(10, 1)
+        loss = F.sup_con_loss(features, labels=torch.randint(0, 3, (10,)))
+        self.assertTrue(torch.isfinite(loss))
 
-        # Similar class features should give lower loss
-        assert loss_similar.item() < loss_random.item()
+    def test_non_contiguous_and_transposed_inputs(self):
+        features = torch.randn(24, 32)[::2]
+        self.assertFalse(features.is_contiguous())
+        self.assertTrue(
+            torch.isfinite(F.sup_con_loss(features, labels=torch.randint(0, 3, (12,))))
+        )
+        transposed = torch.randn(32, 12).t()
+        self.assertTrue(
+            torch.isfinite(
+                F.sup_con_loss(transposed, labels=torch.randint(0, 3, (12,)))
+            )
+        )
 
-    def test_identical_positives_low_loss(self):
-        """Test that identical same-class embeddings give lower loss than random."""
-        # Create two scenarios: identical embeddings vs random
-        torch.manual_seed(42)
-        
-        # Identical embeddings within class
-        base = torch.randn(1, 64)
-        features_identical = base.repeat(4, 1)
-        labels = torch.zeros(4, dtype=torch.long)
-        loss_identical = sup_con_loss(features_identical, labels=labels)
-        
-        # Random embeddings
-        features_random = torch.randn(4, 64)
-        loss_random = sup_con_loss(features_random, labels=labels)
-        
-        # Identical should have lower loss than random
-        assert loss_identical.item() < loss_random.item()
+    def test_labels_and_mask_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "Cannot specify both"):
+            F.sup_con_loss(
+                torch.randn(8, 32), labels=torch.randint(0, 4, (8,)), mask=torch.eye(8)
+            )
 
+    def test_invalid_dimensions_raise(self):
+        with self.assertRaisesRegex(ValueError, "must be 2D or 3D"):
+            F.sup_con_loss(torch.randn(8), labels=torch.randint(0, 4, (8,)))
+        with self.assertRaisesRegex(ValueError, "2D or 3D"):
+            F.sup_con_loss(torch.randn(2, 3, 4, 5))
 
-class TestSupConLossTorchCompile:
-    """torch.compile compatibility tests."""
+    def test_labels_shape_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            F.sup_con_loss(torch.randn(8, 32), labels=torch.randint(0, 4, (16,)))
 
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
-    def test_compile_functional_with_labels(self):
-        """Test functional API works with torch.compile."""
-        # Use eager backend for portability (avoids C++ compiler issues)
-        compiled_loss = torch.compile(sup_con_loss, backend="eager")
-        features = torch.randn(16, 64)
+    def test_mask_shape_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            F.sup_con_loss(torch.randn(8, 32), mask=torch.eye(16))
+
+    # -- multi-view -------------------------------------------------------
+    def test_multiview_self_supervised(self):
+        loss = F.sup_con_loss(torch.randn(16, 2, 64))
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertGreater(loss.item(), 0)
+
+    def test_multiview_reduction_none_shape(self):
+        loss = F.sup_con_loss(torch.randn(16, 2, 64), reduction="none")
+        self.assertEqual(loss.shape, torch.Size([16, 2]))
+        self.assertTrue((loss >= 0).all())
+
+    def test_multiview_equals_manually_flattened(self):
+        torch.manual_seed(4)
+        batch_size, n_views, dim = 6, 3, 16
+        features = torch.randn(batch_size, n_views, dim)
+        labels = torch.randint(0, 3, (batch_size,))
+        flat_labels = labels.view(-1, 1).repeat(1, n_views).view(-1)
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels),
+            F.sup_con_loss(
+                features.reshape(batch_size * n_views, dim), labels=flat_labels
+            ),
+        )
+
+    def test_multiview_self_supervised_equals_index_labels(self):
+        torch.manual_seed(5)
+        batch_size, n_views, dim = 5, 2, 12
+        features = torch.randn(batch_size, n_views, dim)
+        index_labels = torch.arange(batch_size).view(-1, 1).repeat(1, n_views).view(-1)
+        self.assertEqual(
+            F.sup_con_loss(features),
+            F.sup_con_loss(
+                features.reshape(batch_size * n_views, dim), labels=index_labels
+            ),
+        )
+
+    def test_multiview_square_mask_is_expanded_over_views(self):
+        torch.manual_seed(6)
+        features = torch.randn(4, 2, 8)
+        labels = torch.tensor([0, 0, 1, 1])
+        mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+        self.assertEqual(
+            F.sup_con_loss(features, mask=mask),
+            F.sup_con_loss(features, labels=labels),
+        )
+
+    def test_multiview_single_view_equals_2d(self):
+        torch.manual_seed(7)
+        features = torch.randn(10, 16)
+        labels = torch.randint(0, 3, (10,))
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels),
+            F.sup_con_loss(features.unsqueeze(1), labels=labels),
+        )
+
+    def test_multiview_degenerate_shapes_raise(self):
+        with self.assertRaisesRegex(ValueError, "Invalid features shape"):
+            F.sup_con_loss(torch.randn(4, 0, 8))
+        with self.assertRaisesRegex(ValueError, "Invalid features shape"):
+            F.sup_con_loss(torch.randn(4, 2, 0))
+
+    def test_multiview_shape_mismatches_raise(self):
+        features = torch.randn(6, 2, 16)
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            F.sup_con_loss(features, labels=torch.randint(0, 3, (12,)))
+        with self.assertRaisesRegex(ValueError, "must have shape"):
+            F.sup_con_loss(features, mask=torch.eye(7))
+
+    def test_multiview_gradient_flow(self):
+        features = torch.randn(8, 2, 32, requires_grad=True)
+        F.sup_con_loss(features).backward()
+        self.assertFalse(torch.isnan(features.grad).any())
+
+    def test_multiview_module(self):
+        loss = nn.SupConLoss()(torch.randn(16, 3, 64))
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertGreater(loss.item(), 0)
+
+    # -- numerical stability ----------------------------------------------
+    def test_extreme_input_scales(self):
+        for scale in (1e-8, 1e-4, 1e4, 1e8):
+            with self.subTest(scale=scale):
+                features = torch.randn(12, 16) * scale
+                loss = F.sup_con_loss(features, labels=torch.randint(0, 3, (12,)))
+                self.assertTrue(torch.isfinite(loss))
+
+    def test_extreme_temperatures(self):
+        features = torch.randn(12, 16)
+        labels = torch.randint(0, 3, (12,))
+        for temperature in (1e-6, 1e-3, 1e3, 1e6):
+            with self.subTest(temperature=temperature):
+                loss = F.sup_con_loss(features, labels=labels, temperature=temperature)
+                self.assertTrue(torch.isfinite(loss))
+
+    def test_zero_vectors_do_not_produce_nan(self):
+        loss = F.sup_con_loss(torch.zeros(12, 16), labels=torch.randint(0, 3, (12,)))
+        self.assertFalse(torch.isnan(loss))
+
+    def test_gradient_stability_with_large_logits(self):
+        features = (torch.randn(16, 32) * 10).requires_grad_(True)
         labels = torch.randint(0, 4, (16,))
+        F.sup_con_loss(features, labels=labels, temperature=0.01).backward()
+        self.assertFalse(torch.isnan(features.grad).any())
+        self.assertFalse(torch.isinf(features.grad).any())
 
-        loss_regular = sup_con_loss(features, labels=labels)
-        loss_compiled = compiled_loss(features, labels=labels)
+    # -- invariances ------------------------------------------------------
+    def test_invariant_to_input_rescaling(self):
+        features = torch.randn(12, 16)
+        labels = torch.randint(0, 3, (12,))
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels),
+            F.sup_con_loss(features * 7.5, labels=labels),
+        )
 
-        assert torch.allclose(loss_regular, loss_compiled, atol=1e-5)
+    def test_invariant_to_permutation(self):
+        torch.manual_seed(26)
+        features = torch.randn(12, 16)
+        labels = torch.randint(0, 3, (12,))
+        permutation = torch.randperm(12)
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels, reduction="sum"),
+            F.sup_con_loss(
+                features[permutation], labels=labels[permutation], reduction="sum"
+            ),
+        )
 
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
+    def test_inputs_are_not_mutated(self):
+        features = torch.randn(12, 16)
+        labels = torch.randint(0, 3, (12,))
+        mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+        features_original, mask_original = features.clone(), mask.clone()
+        F.sup_con_loss(features, mask=mask)
+        self.assertEqual(features, features_original)
+        self.assertEqual(mask, mask_original)
+
+    # -- dtypes -----------------------------------------------------------
+    def test_dtype_is_preserved(self):
+        labels = torch.randint(0, 3, (12,))
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                features = torch.randn(12, 16, dtype=dtype)
+                self.assertEqual(F.sup_con_loss(features, labels=labels).dtype, dtype)
+                self.assertEqual(
+                    F.sup_con_loss(features, labels=labels, reduction="none").dtype,
+                    dtype,
+                )
+
+    def test_dtype_preserved_when_some_anchors_lack_positives(self):
+        """The no-positive mask must not silently downcast float64."""
+        features = torch.randn(8, 16, dtype=torch.float64)
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        self.assertEqual(
+            F.sup_con_loss(features, labels=labels, reduction="none").dtype,
+            torch.float64,
+        )
+
+    def test_low_precision_dtypes(self):
+        labels = torch.randint(0, 4, (16,))
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                features = torch.randn(16, 32, dtype=dtype)
+                self.assertTrue(torch.isfinite(F.sup_con_loss(features, labels=labels)))
+
+    def test_integer_label_dtypes(self):
+        features = torch.randn(8, 16)
+        base = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        expected = F.sup_con_loss(features, labels=base)
+        for dtype in (torch.int8, torch.int16, torch.int32, torch.long):
+            with self.subTest(dtype=dtype):
+                self.assertEqual(
+                    F.sup_con_loss(features, labels=base.to(dtype)), expected
+                )
+
+    def test_bool_mask_is_accepted(self):
+        features = torch.randn(8, 16)
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+        bool_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
+        self.assertEqual(
+            F.sup_con_loss(features, mask=bool_mask),
+            F.sup_con_loss(features, labels=labels),
+        )
+
+    # -- module plumbing --------------------------------------------------
+    def test_module_attributes(self):
+        for name in ("temperature", "base_temperature", "reduction"):
+            self.assertIn(name, nn.SupConLoss.__constants__)
+        loss_fn = nn.SupConLoss(temperature=0.1, base_temperature=0.05, reduction="sum")
+        self.assertIn("SupConLoss", repr(loss_fn))
+        self.assertIsInstance(loss_fn, nn.Module)
+        self.assertEqual(list(loss_fn.parameters()), [])
+
+    def test_module_matches_functional_for_all_reductions(self):
+        features = torch.randn(12, 16)
+        labels = torch.randint(0, 3, (12,))
+        for reduction in ("none", "mean", "sum"):
+            with self.subTest(reduction=reduction):
+                loss_fn = nn.SupConLoss(
+                    temperature=0.2, base_temperature=0.1, reduction=reduction
+                )
+                self.assertEqual(
+                    loss_fn(features, labels=labels),
+                    F.sup_con_loss(
+                        features,
+                        labels=labels,
+                        temperature=0.2,
+                        base_temperature=0.1,
+                        reduction=reduction,
+                    ),
+                )
+
+    def test_deepcopy_and_state_dict(self):
+        import copy
+
+        loss_fn = nn.SupConLoss(temperature=0.42)
+        self.assertEqual(copy.deepcopy(loss_fn).temperature, 0.42)
+        other = nn.SupConLoss()
+        other.load_state_dict(loss_fn.state_dict())
+        self.assertEqual(loss_fn.state_dict(), other.state_dict())
+
+    # -- scripting and compilation ----------------------------------------
+    def test_torchscript(self):
+        scripted = torch.jit.script(nn.SupConLoss(temperature=0.1))
+        features = torch.randn(12, 16, requires_grad=True)
+        labels = torch.randint(0, 3, (12,))
+        loss = scripted(features, labels)
+        self.assertEqual(loss, F.sup_con_loss(features, labels=labels, temperature=0.1))
+        loss.backward()
+        self.assertEqual(features.grad.shape, features.shape)
+
+    def test_torchscript_multiview(self):
+        scripted = torch.jit.script(nn.SupConLoss())
+        features = torch.randn(6, 2, 16)
+        self.assertEqual(scripted(features), F.sup_con_loss(features))
+
+    def test_compile_fullgraph(self):
+        compiled = torch.compile(F.sup_con_loss, fullgraph=True, backend="eager")
+        features = torch.randn(16, 32)
+        labels = torch.randint(0, 4, (16,))
+        self.assertEqual(
+            compiled(features, labels=labels),
+            F.sup_con_loss(features, labels=labels),
+        )
+
     def test_compile_module(self):
-        """Test module works with torch.compile."""
-        loss_fn = SupConLoss()
-        compiled_fn = torch.compile(loss_fn, backend="eager")
+        loss_fn = nn.SupConLoss()
+        compiled = torch.compile(loss_fn, fullgraph=True, backend="eager")
         features = torch.randn(16, 64)
         labels = torch.randint(0, 4, (16,))
+        self.assertEqual(
+            compiled(features, labels=labels), loss_fn(features, labels=labels)
+        )
 
-        loss_regular = loss_fn(features, labels=labels)
-        loss_compiled = compiled_fn(features, labels=labels)
-
-        assert torch.allclose(loss_regular, loss_compiled, atol=1e-5)
-
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
     def test_compile_with_mask(self):
-        """Test torch.compile with custom mask."""
-        compiled_loss = torch.compile(sup_con_loss, backend="eager")
+        compiled = torch.compile(F.sup_con_loss, backend="eager")
         features = torch.randn(8, 32)
         labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
         mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+        self.assertEqual(
+            compiled(features, mask=mask), F.sup_con_loss(features, mask=mask)
+        )
 
-        loss_regular = sup_con_loss(features, mask=mask)
-        loss_compiled = compiled_loss(features, mask=mask)
-
-        assert torch.allclose(loss_regular, loss_compiled, atol=1e-5)
-
-
-class TestSupConLossDevice:
-    """Device compatibility tests."""
-
-    def test_cpu(self):
-        """Test on CPU."""
-        features = torch.randn(16, 64, device="cpu")
-        labels = torch.randint(0, 4, (16,), device="cpu")
-        loss = sup_con_loss(features, labels=labels)
-        assert loss.device.type == "cpu"
-
-    @pytest.mark.skipif(
-        not torch.backends.mps.is_available(), reason="MPS not available"
-    )
-    def test_mps(self):
-        """Test on MPS (Apple Silicon)."""
-        device = torch.device("mps")
-        features = torch.randn(16, 64, device=device)
-        labels = torch.randint(0, 4, (16,), device=device)
-        loss = sup_con_loss(features, labels=labels)
-        assert loss.device.type == "mps"
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda(self):
-        """Test on CUDA."""
-        device = torch.device("cuda")
-        features = torch.randn(16, 64, device=device)
-        labels = torch.randint(0, 4, (16,), device=device)
-        loss = sup_con_loss(features, labels=labels)
-        assert loss.device.type == "cuda"
-
-
-class TestSupConLossModuleAttributes:
-    """Test module attributes and JIT compatibility."""
-
-    def test_constants_defined(self):
-        """Test __constants__ is defined for JIT."""
-        assert hasattr(SupConLoss, "__constants__")
-        assert "temperature" in SupConLoss.__constants__
-        assert "base_temperature" in SupConLoss.__constants__
-        assert "reduction" in SupConLoss.__constants__
-
-    def test_repr(self):
-        """Test module repr."""
-        loss_fn = SupConLoss(temperature=0.1, base_temperature=0.05, reduction="sum")
-        repr_str = repr(loss_fn)
-        assert "SupConLoss" in repr_str
-
-    def test_module_inheritance(self):
-        """Test proper inheritance."""
-        from torch.nn.modules.loss import _Loss
-
-        loss_fn = SupConLoss()
-        assert isinstance(loss_fn, _Loss)
-        assert isinstance(loss_fn, torch.nn.Module)
-
-
-class TestSupConLossMultiView:
-    """Multi-view batch support tests."""
-
-    def test_multiview_self_supervised(self):
-        """Test self-supervised contrastive learning with multi-view inputs."""
-        # 16 samples with 2 augmented views each
-        features = torch.randn(16, 2, 64)
-        loss = sup_con_loss(features)
-        assert loss.shape == ()
-        assert loss.item() > 0
-
-    def test_multiview_with_labels(self):
-        """Test multi-view inputs with class labels."""
-        features = torch.randn(16, 2, 64)
-        labels = torch.randint(0, 4, (16,))
-        loss = sup_con_loss(features, labels=labels)
-        assert loss.shape == ()
-        assert loss.item() >= 0
-
-    def test_multiview_reduction_none(self):
-        """Test reduction='none' with multi-view inputs returns (N, n_views)."""
-        features = torch.randn(16, 2, 64)
-        loss = sup_con_loss(features, reduction="none")
-        assert loss.shape == (16, 2)
-        assert (loss >= 0).all()
-
-    def test_multiview_module(self):
-        """Test module API with multi-view inputs."""
-        loss_fn = SupConLoss()
-        features = torch.randn(16, 3, 64)
-        loss = loss_fn(features)
-        assert loss.shape == ()
-        assert loss.item() > 0
-
-    def test_multiview_gradient_flow(self):
-        """Test gradient flow through multi-view inputs."""
-        features = torch.randn(8, 2, 32, requires_grad=True)
-        loss = sup_con_loss(features)
-        loss.backward()
-        assert features.grad is not None
-        assert not torch.isnan(features.grad).any()
-
-    @pytest.mark.skipif(
-        not hasattr(torch, "compile"), reason="torch.compile not available"
-    )
-    def test_multiview_compile(self):
-        """Test multi-view inputs with torch.compile."""
-        compiled_loss = torch.compile(sup_con_loss, backend="eager")
+    def test_compile_multiview(self):
+        compiled = torch.compile(F.sup_con_loss, fullgraph=True, backend="eager")
         features = torch.randn(8, 2, 32)
-        loss_reg = sup_con_loss(features)
-        loss_comp = compiled_loss(features)
-        assert torch.allclose(loss_reg, loss_comp, atol=1e-5)
+        self.assertEqual(compiled(features), F.sup_con_loss(features))
+
+    def test_compile_dynamic_shapes(self):
+        compiled = torch.compile(F.sup_con_loss, dynamic=True, backend="eager")
+        for batch_size in (8, 16, 32):
+            with self.subTest(batch_size=batch_size):
+                features = torch.randn(batch_size, 24)
+                labels = torch.randint(0, 3, (batch_size,))
+                self.assertEqual(
+                    compiled(features, labels=labels),
+                    F.sup_con_loss(features, labels=labels),
+                )
+
+    def test_compile_backward(self):
+        compiled = torch.compile(F.sup_con_loss, backend="eager")
+        features = torch.randn(12, 16, requires_grad=True)
+        compiled(features, labels=torch.randint(0, 3, (12,))).backward()
+        self.assertFalse(torch.isnan(features.grad).any())
 
 
-class TestSupConLossJIT:
-    """Test TorchScript compatibility.
+class TestSupConLossDevice(TestCase):
+    """Device-parameterized coverage."""
 
-    Note: SupConLoss is not fully scriptable due to Optional[Tensor] keyword
-    arguments (labels, mask), which is a known TorchScript limitation shared by
-    other PyTorch losses. Use torch.compile instead (tested in TestSupConLossTorchCompile).
-    """
+    def test_device_of_output_matches_input(self, device):
+        features = torch.randn(16, 64, device=device)
+        labels = torch.randint(0, 4, (16,), device=device)
+        loss = F.sup_con_loss(features, labels=labels)
+        self.assertEqual(loss.device.type, torch.device(device).type)
 
-    def test_jit_script_not_supported(self):
-        """Verify SupConLoss raises on torch.jit.script (Optional kwargs limitation)."""
-        loss_fn = SupConLoss(temperature=0.1)
-        with pytest.raises(RuntimeError):
-            torch.jit.script(loss_fn)
+    def test_gradient_on_device(self, device):
+        features = torch.randn(16, 32, device=device, requires_grad=True)
+        labels = torch.randint(0, 4, (16,), device=device)
+        F.sup_con_loss(features, labels=labels).backward()
+        self.assertIsNotNone(features.grad)
+        self.assertFalse(torch.isnan(features.grad).any())
+
+    def test_multiview_on_device(self, device):
+        features = torch.randn(8, 2, 32, device=device)
+        loss = F.sup_con_loss(features)
+        self.assertEqual(loss.device.type, torch.device(device).type)
+
+    @onlyCPU
+    def test_cpu_double_precision(self, device):
+        features = torch.randn(12, 16, device=device, dtype=torch.double)
+        labels = torch.randint(0, 3, (12,), device=device)
+        self.assertEqual(F.sup_con_loss(features, labels=labels).dtype, torch.double)
+
+
+instantiate_device_type_tests(TestSupConLossDevice, globals())
+
+
+if __name__ == "__main__":
+    run_tests()
